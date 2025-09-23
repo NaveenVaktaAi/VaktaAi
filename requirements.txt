@@ -24,3 +24,10 @@ PyMuPDF
 pymongo
 langchain-community
 asgiref
+docx2python
+redis
+youtube-transcript-api
+indic-transliteration
+yt-dlp
+faster-whisper
+openai-whisper

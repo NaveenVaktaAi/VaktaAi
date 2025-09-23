@@ -22,9 +22,10 @@ OPENAI_API_KEY=your_actual_api_key_here
 4. Run the server:
 \`\`\`bash
 python main.py
+uvicorn app.main:app --reload --port 5000
 \`\`\`
 
-The server will start on `http://localhost:8000`
+The server will start on `http://localhost:5000`
 
 ## Features
 

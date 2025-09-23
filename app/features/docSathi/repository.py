@@ -1,3 +1,5 @@
+from app.utils.youtube_transcript import get_transcript_with_cache
+from app.youtubeService.document_processor import DocumentProcessor
 from app.aws.secretKey import session
 from app.config.settings import settings
 from app.database.session import get_db
@@ -19,10 +21,11 @@ from app.features.docSathi.schema import UploadDocuments
 # from app.config import env_variables
 import nltk
 import numpy as np
-from fastapi import  HTTPException
+from fastapi import  HTTPException, BackgroundTasks
 from transformers import LEDForConditionalGeneration, LEDTokenizer
 import torch
 from nltk.tokenize import sent_tokenize
+from urllib.parse import urlparse, parse_qs
 # env_vars = env_variables()
 
 from bson import ObjectId
@@ -48,6 +51,7 @@ from app.utils.delete_from_aws import delete_document_from_s3
 from app.utils.milvus.operations.crud import insert_chunk_to_milvus
 from app.database.mongo_collections import update_document_status
 from bson import ObjectId
+document_processor = DocumentProcessor()
 
 
 # Creating instance meaning full summary 
@@ -130,7 +134,7 @@ def extract_text(file_data: bytes, document_format: str) -> str:
                 for page_num in range(len(pdf_document))
             )
         elif document_format == "docx":
-            file_stream = io.BytesIO(file_data)
+            file_stream = BytesIO(file_data)
             doc = Document(file_stream)
             return "\n".join(
                 f"\u2022 {p.text.strip()}" if p.style.name.lower().startswith("list") else p.text.strip()
@@ -173,13 +177,13 @@ async def read_and_train_private_file(
     try:
         print("Processing data:", data)
         
-        # Count how many input types are provided
+        # Count how many input types are provided (only one should be provided at a time)
         input_types = 0
-        if data.FileData and len(data.FileData) > 0:
+        if data.file_data is not None:
             input_types += 1
-        if data.WebsiteUrls and len(data.WebsiteUrls) > 0:
+        if data.website_url is not None:
             input_types += 1  
-        if data.YoutubeUrls and len(data.YoutubeUrls) > 0:
+        if data.youtube_url is not None:
             input_types += 1
             
         # Validate: Only one input type allowed at a time
@@ -193,17 +197,17 @@ async def read_and_train_private_file(
             return {
                 "message": "Multiple input types not allowed",
                 "success": False,
-                "error": "Please provide only one type: FileData OR WebsiteUrls OR YoutubeUrls"
+                "error": "Please provide only one type: FileData OR WebsiteUrl OR YoutubeUrl"
             }
         
-        # Process based on input type
-        if data.FileData and len(data.FileData) > 0:
-            results = await process_file_data(data.FileData, data.documentFormat, data.type)
-        elif data.WebsiteUrls and len(data.WebsiteUrls) > 0:
-            results = await process_website_urls(data.WebsiteUrls, data.type)
-        elif data.YoutubeUrls and len(data.YoutubeUrls) > 0:
-            results = await process_youtube_urls(data.YoutubeUrls, data.type)
-
+        # Process based on input type (single item processing)
+        if data.file_data is not None:
+            results = await process_single_file(data.file_data, data.document_format, data.type)
+        elif data.website_url is not None:
+            results = await process_single_website(data.website_url, data.type)
+        elif data.youtube_url is not None:
+            results = await process_single_youtube(data.youtube_url, data.type)
+            
         return {
             "message": "Document processing completed",
             "results": results,
@@ -220,8 +224,72 @@ async def read_and_train_private_file(
         }
 
 
+async def process_single_file(file_data, document_format, doc_type):
+    """Process single file upload from S3"""
+    bucket_name = settings.S3_BUCKET_NAME
+    results = []
+    
+    print(f"Processing file: {file_data.fileNameTime}")
+    try:
+        # Get file from S3
+        s3_object = (
+            s3_resources.Bucket(bucket_name)
+            .Object(f"vaktaAi/{file_data.fileNameTime}")
+            .get()
+        )
+        file_data_content = s3_object["Body"].read()
+
+        # Extract text based on document format
+        text = extract_text(file_data_content, document_format)
+        if not text.strip():
+            results.append({
+                "fileName": file_data.fileNameTime,
+                "message": "No content extracted from file",
+                "success": False,
+            })
+            return results
+
+        
+        # Add document record to Mongo
+        db = next(get_db())
+        doc_payload = DocSathiAIDocumentCreate(
+            user_id=1,  # TODO: Get actual user_id
+            name=file_data.fileNameTime,
+            url=file_data.signedUrl,
+            status="processing",
+            document_format=document_format,
+            type=(doc_type or "").lower() if doc_type else None,
+            summary=None,
+        )
+        
+        new_document_id = create_document(db, doc_payload.dict(exclude_none=True))
+
+        # Start training in a separate thread
+        threading.Thread(
+                target=train_document,
+                args=(text, new_document_id, doc_type, "1"),
+            ).start()
+        results.append({
+            "fileName": file_data.fileNameTime,
+            "documentId": new_document_id,
+            "message": "File processed successfully",
+            "success": True,
+        })
+        
+    except Exception as file_error:
+        print(f"Error processing file {file_data.fileNameTime}: {file_error}")
+        results.append({
+            "fileName": file_data.fileNameTime,
+            "message": f"Error processing file: {str(file_error)}",
+            "success": False,
+            "error": str(file_error),
+        })
+    
+    return results
+
+
 async def process_file_data(file_data_list, document_format, doc_type):
-    """Process multiple file uploads from S3"""
+    """Process multiple file uploads from S3 (legacy function)"""
     bucket_name = settings.S3_BUCKET_NAME
     results = []
     
@@ -262,7 +330,7 @@ async def process_file_data(file_data_list, document_format, doc_type):
             new_document_id = create_document(db, doc_payload.dict(exclude_none=True))
 
             # Train the document
-            train_document(text, new_document_id, document_format or "file", "1")
+            # train_document(text, new_document_id, document_format or "file", "1")
             # Start training in a separate thread
             threading.Thread(
                     target=train_document,
@@ -289,20 +357,83 @@ async def process_file_data(file_data_list, document_format, doc_type):
     return results
 
 
+async def process_single_website(website_url, doc_type):
+    """Process single website URL"""
+    results = []
+    
+    print(f"Processing website URL: {website_url}")
+    try:
+        # Scrape website content
+        scraped_data = scrape_website_content(website_url)
+        
+        if not scraped_data['text'].strip():
+            results.append({
+                "source": "website",
+                "url": website_url,
+                "message": "No content extracted from website",
+                "success": False,
+            })
+            return results
+        
+        # Generate document name from scraped content
+        doc_name = generate_document_name_from_text(scraped_data['text'], "website")
+        
+        # Add document record to Mongo
+        db = next(get_db())
+        doc_payload = DocSathiAIDocumentCreate(
+            user_id=1,  # TODO: Get actual user_id
+            name=doc_name,
+            url=website_url,
+            status="processing",
+            document_format="webUrl",
+            type=doc_type or "website",
+        )
+        
+        new_document_id = create_document(db, doc_payload.dict(exclude_none=True))
+        print(f"Website document created with ID: {new_document_id}")
+        
+        # Train the document
+        threading.Thread(
+                target=train_document,
+                args=(scraped_data['text'], new_document_id, doc_type, "1"),
+            ).start()
+        
+        results.append({
+            "source": "website",
+            "url": website_url,
+            "documentId": new_document_id,
+            "documentName": doc_name,
+            "message": "Website processed successfully",
+            "success": True,
+        })
+        
+    except Exception as web_error:
+        print(f"Error processing website URL {website_url}: {web_error}")
+        results.append({
+            "source": "website",
+            "url": website_url,
+            "message": f"Error processing website: {str(web_error)}",
+            "success": False,
+            "error": str(web_error),
+        })
+    
+    return results
+
+
 async def process_website_urls(website_urls, doc_type):
-    """Process multiple website URLs"""
+    """Process multiple website URLs (legacy function)"""
     results = []
     
     for url in website_urls:
-        print(f"Processing website URL: {url.url}")
+        print(f"Processing website URL: {url}")
         try:
             # Scrape website content
-            scraped_data = scrape_website_content(url.url)
+            scraped_data = scrape_website_content(url)
             
             if not scraped_data['text'].strip():
                 results.append({
                     "source": "website",
-                    "url": url.url,
+                    "url": url,
                     "message": "No content extracted from website",
                     "success": False,
                 })
@@ -316,7 +447,7 @@ async def process_website_urls(website_urls, doc_type):
             doc_payload = DocSathiAIDocumentCreate(
                 user_id=1,  # TODO: Get actual user_id
                 name=doc_name,
-                url=url.url,
+                url=url,
                 status="processing",
                 document_format="webUrl",
                 type=doc_type or "website",
@@ -333,7 +464,7 @@ async def process_website_urls(website_urls, doc_type):
             
             results.append({
                 "source": "website",
-                "url": url.url,
+                "url": url,
                 "documentId": new_document_id,
                 "documentName": doc_name,
                 "message": "Website processed successfully",
@@ -341,10 +472,10 @@ async def process_website_urls(website_urls, doc_type):
             })
             
         except Exception as web_error:
-            print(f"Error processing website URL {url.url}: {web_error}")
+            print(f"Error processing website URL {url}: {web_error}")
             results.append({
                 "source": "website",
-                "url": url.url,
+                "url": url,
                 "message": f"Error processing website: {str(web_error)}",
                 "success": False,
                 "error": str(web_error),
@@ -352,21 +483,115 @@ async def process_website_urls(website_urls, doc_type):
     
     return results
 
+def get_video_id(url: str) -> str:
+    """
+    Extract video id from YouTube URL
+    """
+    parsed_url = urlparse(url)
+    if parsed_url.hostname in ["www.youtube.com", "youtube.com"]:
+        # Example: https://www.youtube.com/watch?v=VIDEO_ID
+        return parse_qs(parsed_url.query).get("v", [None])[0]
+    elif parsed_url.hostname == "youtu.be":
+        # Example: https://youtu.be/VIDEO_ID
+        return parsed_url.path.lstrip("/")
+    return None
+
+async def process_single_youtube(youtube_url, doc_type):
+    """Process single YouTube URL"""
+    results = []
+    
+    print(f"Processing YouTube URL: {youtube_url}")
+    try:
+        get_video_id = extract_youtube_video_id(youtube_url)
+        print("++++++++++++++++++++++++videoid+++++++++++++++++++++++++++++",get_video_id)
+        if not get_video_id:
+            results.append({
+                "source": "youtube",
+                "url": youtube_url,
+                "message": "No video ID found in YouTube URL",
+                "success": False,
+            })
+            return results
+        data = await get_transcript_with_cache(youtube_url, get_video_id)
+        print("not able to get transcript from cache----------",data)
+        
+        # Convert segments list to text if needed
+        if isinstance(data, list):
+            data = " ".join(data) if data else ""
+        
+        if not data or len(data.strip()) == 0:
+            data = await document_processor.process_youtube(youtube_url, doc_type)
+        # Extract transcript from YouTube
+        print("data>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>data>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>",data)
+        if not data.strip():
+            results.append({
+                "source": "youtube",
+                "url": youtube_url,
+                "message": "No transcript extracted from YouTube video",
+                "success": False,
+            })
+            return results
+        
+        # Generate document name from transcript
+        doc_name = generate_document_name_from_text(data, "video")
+        print("---------------------",doc_name)
+        # Add document record to Mongo
+        db = next(get_db())
+        doc_payload = DocSathiAIDocumentCreate(
+            user_id=1,  # TODO: Get actual user_id
+            name=doc_name,
+            url=youtube_url,
+            status="processing",
+            document_format="videoUrl",
+            type=doc_type or "video",
+            summary=None,
+        )
+        
+        new_document_id = create_document(db, doc_payload.dict(exclude_none=True))
+        print(f"YouTube document created with ID: {new_document_id}")
+        
+        # Train the document
+        threading.Thread(
+                target=train_document,
+                args=(data, new_document_id, doc_type, "1"),
+            ).start()
+        
+        results.append({
+            "source": "youtube",
+            "url": youtube_url,
+            "documentId": new_document_id,
+            "documentName": doc_name,
+            "message": "YouTube video processed successfully",
+            "success": True,
+        })
+        
+    except Exception as youtube_error:
+        print(f"Error processing YouTube URL {youtube_url}: {youtube_error}")
+        results.append({
+            "source": "youtube",
+            "url": youtube_url,
+            "message": f"Error processing YouTube video: {str(youtube_error)}",
+            "success": False,
+            "error": str(youtube_error),
+        })
+    
+    return results
+
 
 async def process_youtube_urls(youtube_urls, doc_type):
-    """Process multiple YouTube URLs"""
+    """Process multiple YouTube URLs (legacy function)"""
     results = []
     
     for url in youtube_urls:
-        print(f"Processing YouTube URL: {url.url}")
+        print(f"Processing YouTube URL: {url}")
         try:
             # Extract transcript from YouTube
-            youtube_data = extract_youtube_transcript(url.url)
+            youtube_data = extract_youtube_transcript(url)
             
             if not youtube_data['text'].strip():
                 results.append({
                     "source": "youtube",
-                    "url": url.url,
+                    "url": url,
                     "message": "No transcript extracted from YouTube video",
                     "success": False,
                 })
@@ -381,7 +606,7 @@ async def process_youtube_urls(youtube_urls, doc_type):
                 user_id=1,  # TODO: Get actual user_id
                 organization_id=1,  # TODO: Get actual org_id
                 name=doc_name,
-                url=url.url,
+                url=url,
                 status="processing",
                 document_format="videoUrl",
                 type=doc_type or "video",
@@ -398,7 +623,7 @@ async def process_youtube_urls(youtube_urls, doc_type):
             
             results.append({
                 "source": "youtube",
-                "url": url.url,
+                "url": url,
                 "documentId": new_document_id,
                 "documentName": doc_name,
                 "message": "YouTube video processed successfully",
@@ -406,10 +631,10 @@ async def process_youtube_urls(youtube_urls, doc_type):
             })
             
         except Exception as youtube_error:
-            print(f"Error processing YouTube URL {url.url}: {youtube_error}")
+            print(f"Error processing YouTube URL {url}: {youtube_error}")
             results.append({
                 "source": "youtube",
-                "url": url.url,
+                "url": url,
                 "message": f"Error processing YouTube video: {str(youtube_error)}",
                 "success": False,
                 "error": str(youtube_error),
@@ -432,14 +657,14 @@ def train_document(text: str, document_id: str, document_type: str, org_id: str)
         # chunks,summary = create_text_chunks(text.lower()) 
     
         # Generate meaningful chunks
-        chunks, summary = create_meaningful_chunks(text)
+        chunks = create_meaningful_chunks(text)
         print("v>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>train_document>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>",chunks)
         
         # Print Chunks
         # for i, chunk in enumerate(chunks):
         #     print(f"\n🔹 Meaningful Chunk {i+1}:\n{chunk}")
         # chunks = create_text_chunks(text.lower()) 
-        print("summary>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>train_document>>>>>>>>>>",summary)
+        # print("summary>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>train_document>>>>>>>>>>",summary)
         print(f"Text chunks>>>>>>>>>>>>>>>>>>>>>>train_document>>>>>>>>>>>>>>>>>>>>>>>>: {chunks}")
         if chunks:
             for item in chunks:
@@ -449,7 +674,6 @@ def train_document(text: str, document_id: str, document_type: str, org_id: str)
                     "meta_summary": "Default summary",
                     "chunk": item,
                     "training_document_id": ObjectId(document_id),
-                    "question_id": None,
                     "organization_id": org_id,
                     "created_ts": datetime.now(),
                     "updated_ts": datetime.now(),
@@ -460,7 +684,7 @@ def train_document(text: str, document_id: str, document_type: str, org_id: str)
 
         # Update document status to completed
         print(f"Updating document {document_id} status to completed")
-        update_document_status(db, document_id, {"status": "completed", "summary": summary, "updated_ts": datetime.now()})
+        update_document_status(db, document_id, {"status": "completed", "summary": "default summary", "updated_ts": datetime.now()})
 
     except Exception as e:
         print(f"Error in train_document: {e}")
@@ -648,10 +872,9 @@ def create_meaningful_chunks(text, similarity_threshold=0.5):
             chunks.append(" ".join(current_chunk))
 
         # ✅ Generate summary AFTER chunking for better context
-        summary = create_summary(" ".join(chunks))  # Generate summary based on final chunks
+        # summary = create_summary(" ".join(chunks))  # Generate summary based on final chunks
 
-        return chunks, summary
-
+        return chunks
     except Exception as e:
         print(f"🚨 Unexpected error in create_meaningful_chunks: {e}")
         return [], ""
@@ -659,11 +882,11 @@ def create_meaningful_chunks(text, similarity_threshold=0.5):
 
 
 
-def create_summary(text: str) -> str:
+def create_summary(text: list) -> str:
     try:
-        word_count = len(text.split())  # Get document size
+        word_count = len(text)  # Get document size
         min_length, max_length = get_summary_length(word_count)  # Dynamic summary size
-
+        print("WORD COUNT--------------------cm,---------",word_count)
         chunks = chunk_text(text, max_tokens=10000)  # Adjust chunk size
         summaries = []
 
@@ -685,6 +908,7 @@ def create_summary(text: str) -> str:
             )
 
             summary = tokenizer.decode(summary_ids[0], skip_special_tokens=True)
+            print("SUMMARY--------------------cm,---------",summary)
             summaries.append(summary)
 
         return " ".join(summaries)

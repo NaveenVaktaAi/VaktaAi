@@ -1,10 +1,9 @@
 from typing import List, Optional
-from pydantic import BaseModel, EmailStr
+from pydantic import BaseModel, EmailStr, Field
 from datetime import datetime
 
 class PreSignedUrl(BaseModel):
     fileFormat: str
-
 
 
 class FileData(BaseModel):
@@ -12,21 +11,12 @@ class FileData(BaseModel):
     fileNameTime: str
 
 
-class WebsiteUrls(BaseModel):
-    url: str
-
-
-class YoutubeUrls(BaseModel):
-    url: str
-
-
 class UploadDocuments(BaseModel):
-    FileData: Optional[List[FileData]] = None
+    file_data: Optional["FileData"] = Field(None, alias="FileData")
     type: Optional[str] = None
-    WebsiteUrls: Optional[List[WebsiteUrls]] = None 
-    YoutubeUrls: Optional[List[YoutubeUrls]] = None
-    documentFormat: Optional[str] = None
-
+    website_url: Optional[str] = Field(None, alias="WebsiteUrl")   # single URL instead of array
+    youtube_url: Optional[str] = Field(None, alias="YoutubeUrl")   # single URL instead of array
+    document_format: Optional[str] = Field(None, alias="documentFormat")
 
 
 
