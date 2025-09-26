@@ -214,8 +214,8 @@ class WebSocket(StarletteWebSocket):
         return self.scope["user"]
 
     @cached_property
-    def chat_user_id_org_id(self) -> str:
-        return f"{self.chat_user.id}:{self.chat_user.org_id}"
+    def chat_user_id_document_id(self) -> str:
+        return f"{self.chat_user.id}:{self.chat_user.document_id}"
 
     @property
     def websocket_session_id(self) -> str:

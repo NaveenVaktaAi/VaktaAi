@@ -7,8 +7,10 @@ from typing import Optional, Dict, Any, List
 from fastapi import WebSocket
 import numpy as np
 from sqlalchemy import Integer, func, or_
+from bson import ObjectId
+from app.features.chat.utils.response import ResponseCreator
 from app.schemas.milvus.collection.milvus_collections import chunk_msmarcos_collection
-from VaktaAi.app.schemas.schemas import ChunkBase, DocSathiAIDocumentBase
+from app.schemas.schemas import ChunkBase, DocSathiAIDocumentBase
 from rank_bm25 import BM25Okapi
 from nltk.tokenize import word_tokenize
 from translate import Translator
@@ -18,7 +20,6 @@ from app.features.chat.websocket_manager import ChatWebSocketResponse
 from app.features.chat.schemas import ChatMessageCreate
 from app.database.session import get_db
 from app.features.chat.semantic_search import BotGraphMixin
-from app.features.bot.utils.response import ResponseCreator
 
 
 logger = logging.getLogger(__name__)
@@ -56,6 +57,7 @@ class MongoDBBotHandler:
         """
         try:
             # Create user message in MongoDB
+            
             user_message_data = ChatMessageCreate(
                 chat_id=self.chat_id,
                 message=user_message,
@@ -73,7 +75,7 @@ class MongoDBBotHandler:
                 return True
             if await self.auto_reply_handler(user_message, "confirmation"):
                 return True
-
+        
             
             # Process user input for keywords and language detection
             message_response = (
@@ -132,7 +134,9 @@ class MongoDBBotHandler:
             should_auto_reply = await self.check_appreciation_message_auto_reply(last_user_text)
         elif auto_reply_type == "confirmation":
             should_auto_reply = await self.check_confirmation_message_auto_reply(last_user_text)
-        
+        elif auto_reply_type == "normal_chat":
+            should_auto_reply = await self.check_normal_chat_message_auto_reply(last_user_text)
+            print(f"SHOULD_AUTO_REPLY normal chat ---------- {should_auto_reply}\n")
         print(f"AUTO_REPLY_TYPE {auto_reply_type}, SHOULD_AUTO_REPLY {should_auto_reply}\n")
 
         if not should_auto_reply:
@@ -223,6 +227,26 @@ class MongoDBBotHandler:
         gpt_res = await ResponseCreator().gpt_response_without_stream(prompt)
         return gpt_res.strip().lower() == "true"
 
+    async def check_normal_chat_message_auto_reply(self, user_input: str) -> bool:
+        """Check if message is a normal chat using GPT"""
+        prompt = [
+            {
+                "role": "system",
+                "content": (
+                    "You are an assistant that determines whether a user's input is a normal chat message. "
+                     "like-  hello, how are you, what is your name, what are you doing, etc. "
+                    "Return 'true' if the input is a normal chat message, otherwise return 'false'."
+                ),
+            },
+            {
+                "role": "user",
+                "content": user_input,
+            },
+        ]
+        gpt_res = await ResponseCreator().gpt_response_without_stream(prompt)
+        print(f"GPT_RES normal chat ---------- {gpt_res}\n")
+        return gpt_res.strip().lower() == "true"
+
     def create_greetings_response(self) -> str:
         """Create greeting response"""
         greetings_responses = [
@@ -287,87 +311,109 @@ class MongoDBBotHandler:
         Processes the bot response by searching answers, translating if needed, and generating GPT response.
         """
         try:
-            # bot_graph_mixin = BotGraphMixin(db=db)
-            # answer_ids = await bot_graph_mixin.search_answers(
-            #     [user_message.lower()], chunk_msmarcos_collection, self.document_id
-            # )
-            # print(f"SEARCH_ANSWERS IDs: {answer_ids}\n")
+            bot_graph_mixin = BotGraphMixin(db=db)
+            answer_ids = await bot_graph_mixin.search_answers(
+                [user_message.lower()], chunk_msmarcos_collection, self.document_id
+            )
+            print(f"SEARCH_ANSWERS IDs: {answer_ids}\n")
+            print("self.document_id-------------------doc--------", self.document_id)
 
-            # if answer_ids:
-            #     chunk_results = (
-            #         db.query(ChunkBase.chunk, DocSathiAIDocumentBase.type, DocSathiAIDocumentBase.summary, DocSathiAIDocumentBase.id)
-            #         .join(DocSathiAIDocumentBase, ChunkBase.training_document_id == DocSathiAIDocumentBase.id)
-            #         .filter(
-            #             ChunkBase.training_document_id == str(self.document_id),
-            #             ChunkBase.id.in_(answer_ids)
-            #         )
-            #         .distinct()
-            #         .all()
-            #     )
+            if answer_ids:
+                try:
+                    pipeline = [
+                        {
+                            "$match": {
+                                "training_document_id": ObjectId(self.document_id),
+                                "_id": {"$in": [ObjectId(aid) for aid in answer_ids]}
+                            }
+                        },
+                        {
+                            "$lookup": {
+                                "from": "docSathi_ai_documents",
+                                "localField": "training_document_id",
+                                "foreignField": "_id",
+                                "as": "document"
+                            }
+                        },
+                        {"$unwind": "$document"},
+                        {
+                            "$project": {
+                                "chunk": 1,
+                                "doc_type": "$document.type",
+                                "doc_id": "$document._id"
+                            }
+                        }
+                    ]
 
-            #     if not chunk_results:
-            #         print("No relevant chunks found.\n")
-            #         return False
-             
-            #     print(f"CHUNK_RESULTS: {chunk_results}\n")
-            #     formatted_results = [
-            #         {"context_data": chunk, "document_type": doc_type, "summary": summary,"document_id":id}
-            #         for chunk, doc_type, summary, id in chunk_results
-            #     ]
-            #     print("formatted_results>>>>>>>>>>>>>>>>>>>>>>>>>>>>>", formatted_results)
+                    chunk_results = list(db["chunks"].aggregate(pipeline))
+                    print(f"CHUNK_RESULTS: {chunk_results}\n")
+
+                    if not chunk_results:
+                        print("No relevant chunks found.\n")
+                        return False
+                 
+                    formatted_results = [
+                        {
+                            "context_data": result["chunk"], 
+                            "document_type": result["doc_type"], 
+                            "summary": "Default summary",
+                            "document_id": str(result["doc_id"])
+                        }
+                        for result in chunk_results
+                    ]
+                except Exception as e:
+                    print(f"ERROR_IN_CHUNK_QUERY: {str(e)}\n")
+                    return False
+                print("formatted_results>>>>>>>>>>>>>>>>>>>>>>>>>>>>>", formatted_results)
                 
-            #     # Get GPT response from chunks
-            #     gpt_resp = await self.get_chunk_response_from_gpt(user_message, formatted_results)
+                # Get GPT response from chunks
+                gpt_resp = await self.get_chunk_response_from_gpt(user_message, formatted_results)
 
-            #     response_data = self.extract_json_from_text(gpt_resp)
-            #     print("response_data>>>>>>>>>>>>>>>>>>>>>>>>>>>>>",response_data)
-            #     answer = response_data.get("answer")
-            #     document_type = response_data.get("document_type")
-            #     gpt_flag = response_data.get("GPT_FLAG")
-            #     print(f"GPT_FLAG >>> {gpt_flag}\n")
-            #     print(f"ANSWER >>> {answer}\n")
+                response_data = self.extract_json_from_text(gpt_resp)
+                print("response_data>>>>>>>>>>>>>>>>>>>>>>>>>>>>>",response_data)
+                answer = response_data.get("answer")
+                document_type = response_data.get("document_type")
+                gpt_flag = response_data.get("GPT_FLAG")
+                print(f"GPT_FLAG >>> {gpt_flag}\n")
+                print(f"ANSWER >>> {answer}\n")
 
-            #     if answer:
-            #         translator = Translator(to_lang=language_code)
-            #         translated_chunk_answer = translator.translate(answer)
-            #         print("inside the if condition>>>>>>>>>>>>>>>>>>>>>>>>>>>>>")
+                if answer:
+                    translator = Translator(to_lang=language_code)
+                    translated_chunk_answer = translator.translate(answer)
+                    print("inside the if condition>>>>>>>>>>>>>>>>>>>>>>>>>>>>>")
                     
-            #         # Streaming response generator
-            #         async def string_to_generator(data):
-            #             for char in data:
-            #                 yield char
-            #                 await asyncio.sleep(0.01)
+                    # Streaming response generator
+                    async def string_to_generator(data):
+                        for char in data:
+                            yield char
+                            await asyncio.sleep(0.01)
 
-            #         generator = string_to_generator(translated_chunk_answer)
-            #         print(f"GENERATOR >>> {generator}\n")
+                    generator = string_to_generator(translated_chunk_answer)
+                    print(f"GENERATOR >>> {generator}\n")
 
-            #         # Send response to frontend
-            #         await self.websocket_response.create_streaming_response(
-            #             generator,
-            #             f"rag_response_{datetime.now().timestamp()}",
-            #             document_type,
-            #             True
-            #         )
+                    # Send response to frontend
+                    await self.websocket_response.create_streaming_response(
+                        generator,
+                        f"rag_response_{datetime.now().timestamp()}",
+                        document_type,
+                        True
+                    )
 
-            #         return True
+                    return True
 
             # Fallback to GPT response if no answer found
             gpt_resp = await ResponseCreator().get_gpt_response(
                 user_message,
-                is_outside_from_document,
-                is_outside_from_industry,
-                None,
-                industry_type,
-                None,
                 language_code,
                 self.chat_id,
             )
             print("gpt_resp>>>>>>>>>>>>>>>>>>>>",gpt_resp)
             if not gpt_resp:
                 return False
-
+            print("gpt_resp>>>>>>>>after if condition>>>>>>>>>>>>",gpt_resp)
             if hasattr(gpt_resp, "__aiter__"):
                 gpt_resp_text = "".join([chunk async for chunk in gpt_resp])
+                print("gpt_resp_text>>>>>>>>in if condition>>>>>>>>>>>>",gpt_resp_text)
             else:
                 gpt_resp_text = gpt_resp
                 print(f"Final GPT Response: {gpt_resp_text}\n")
@@ -379,6 +425,7 @@ class MongoDBBotHandler:
                     await asyncio.sleep(0.01)
 
             generator = string_to_generator(gpt_resp_text)
+            print("generator>>>>>>>>final generator>>>>>>>>>>>>>",generator)
 
             # Send response to frontend
             await self.websocket_response.create_streaming_response(
@@ -711,14 +758,14 @@ class MongoDBBotMessage:
         self,
         chat_id: str,
         user_id: str,
-        org_id: str = None,
+        document_id: str = None,
         websocket_response: ChatWebSocketResponse = None,
         timezone: str = "UTC",
         language_code: str = "en"
     ):
         self.chat_id = chat_id
         self.user_id = user_id
-        self.org_id = org_id
+        self.document_id = document_id
         self.websocket_response = websocket_response
         self.timezone = timezone
         self.language_code = language_code
@@ -733,7 +780,7 @@ class MongoDBBotMessage:
             self.websocket_response,
             self.chat_id,
             self.user_id,
-            self.org_id,
+            self.document_id,
             self.timezone,
             self.language_code
         )

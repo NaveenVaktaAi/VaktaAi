@@ -27,7 +27,9 @@ async def create_chat(chat_data: ChatCreate):
         return {
             "success": True,
             "message": "Chat created successfully",
-            "chat_id": chat_id
+            "data": {
+                "chat_id": chat_id
+            }
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error creating chat: {str(e)}")
@@ -378,6 +380,7 @@ async def websocket_endpoint(websocket: WebSocket, chat_id: str):
     Adapted from the bot system to work with MongoDB chat collections.
     """
     try:
+        print(f"WebSocket connected-------------- for chat {chat_id}")
         await connect_websocket(websocket, chat_id)
         current_time = datetime.now().strftime("%H:%M")
         is_error = False
@@ -403,6 +406,8 @@ async def process_received_data(data: str, chat_id: str, current_time: str, is_e
     """Process received WebSocket data"""
     try:
         received_data = json.loads(data)
+
+        print("received_data----==================data received------", received_data)
         message_type = received_data.get("mt", "")
         message = received_data.get("message", "")
         user_id = received_data.get("userId", "")
@@ -477,7 +482,7 @@ async def handle_message_upload(received_data: dict, chat_id: str, current_time:
         user_id = received_data.get("userId", "")
         timezone = received_data.get("timezone", "UTC")
         language_code = received_data.get("selectedLanguage", "en")
-        
+        document_id = received_data.get("documentId", "")
         # Generate token for user message
         current_time_ms = int(datetime.now().timestamp() * 1000)
         user_message_token = f"{current_time_ms}_{chat_id}"
@@ -510,6 +515,7 @@ async def handle_message_upload(received_data: dict, chat_id: str, current_time:
         bot_message = MongoDBBotMessage(
             chat_id=chat_id,
             user_id=user_id,
+            document_id=document_id,
             websocket_response=websocket_response,
             timezone=timezone,
             language_code=language_code

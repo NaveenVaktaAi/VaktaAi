@@ -43,3 +43,8 @@ class Chunk(BaseModel):
     training_document_id: Optional[int] = None
     created_ts: datetime = datetime.now()
     updated_ts: datetime = datetime.now()
+
+
+
+class documentsIds(BaseModel):
+     document_ids: List[str]  

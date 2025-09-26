@@ -7,20 +7,19 @@ from langchain.memory import ChatMessageHistory
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_openai import ChatOpenAI
 
-from requests import Session
 from sentry_sdk import capture_exception
-from app.database import get_db
-from app.models.chat_message import ChatMessage
+from app.database.session import get_db
+from app.database.mongo_collections import get_chat_messages
 from app.utils.openai.openai import start_openai
-from app.features.aws.secretKey import get_secret_keys
 import asyncio
 import openai
 from typing import AsyncGenerator, Any, List
 import tiktoken
 from fastapi import WebSocket
 import ast
-
-keys = get_secret_keys()
+import os
+from bson import ObjectId
+from datetime import datetime
 
 
 class ResponseCreator:
@@ -33,7 +32,7 @@ class ResponseCreator:
         self.max_tokens_gpt3 = 4096
         self.max_tokens_final = 2049
         self.retry_attempts = 3  # Number of retries for each model
-        self.openai_key = keys.get("OPENAI_API_KEY")
+        self.openai_key = os.getenv("OPENAI_API_KEY", "")
 
     async def get_gpt_response(
         self,
@@ -48,20 +47,14 @@ class ResponseCreator:
             chat_id
         )
 
-    # Function to count tokens in a string
-    def count_tokens(self, text: str, model: str) -> int:
-        enc = tiktoken.encoding_for_model(model)
-        return len(enc.encode(text))
 
     async def generate_response(
         self,
         user_query,
         language_code: str | None,
-        
         chat_id: int | None,
     ) -> AsyncGenerator[str, Any]:
         # Models with their context windows and max token output
-        
         models = [
             ("gpt-3.5-turbo", 16385, 2730),
             ("gpt-3.5-turbo-0125", 16385, 2730),
@@ -70,63 +63,24 @@ class ResponseCreator:
             ("gpt-4-turbo", 128000, 2730),
             ("gpt-4", 8192, 2730),
         ]
-        main_response = (
-            "I'm having trouble right now. You can try again."
-        )
+        
+        main_response = "I'm having trouble right now. You can try again."
         response = main_response
-
-        # Function to split messages into manageable chunks
-        def split_messages(example_res, context_window, model, max_output_tokens):
-            if example_res:
-                example_res_text = " ".join(example_res)
-                example_tokens = self.count_tokens(example_res_text, model)
-                total_token_limit = context_window - max_output_tokens
-
-            # If the example fits within the context window, return as a single chunk
-                if example_tokens <= total_token_limit:
-                    return [example_res_text]
-
-                # Calculate the number of segments needed
-                num_segments = -(-example_tokens // total_token_limit)  # Ceiling division
-                segment_length = len(example_res_text) // num_segments
-
-                # Split the text into chunks of approximately equal size
-                return [
-                    example_res_text[i : i + segment_length]
-                    for i in range(0, len(example_res_text), segment_length)
-                ]
-            
-            return []
-
 
         async def handle_response():
             nonlocal main_response
             try:
-                # Change time here
                 await asyncio.wait_for(_handle_response_inner(), timeout=30)
             except asyncio.TimeoutError:
                 print("Loop exceeded 30 seconds.")
             except Exception as e:
                 print(f"An error occurred: {e}")
-
             return main_response
 
         async def _handle_response_inner():
-            nonlocal response
-            nonlocal main_response
+            nonlocal response, main_response
 
             for modelName, context_window, max_output_tokens in models:
-                if example_response is not None:
-                    total_tokens = self.count_tokens(" ".join(example_response), modelName)
-                    if total_tokens > context_window - max_output_tokens :
-                        example_response_chunked = split_messages(
-                            example_response, context_window, modelName, max_output_tokens
-                        )
-                else:
-                    example_response_chunked = example_response
-                    
-                print("example_response_chunked>>>>>>>>>>>>>>>>>>>>>",example_response_chunked)
-
                 try:
                     chat = ChatOpenAI(
                         model=modelName,
@@ -135,23 +89,27 @@ class ResponseCreator:
                         api_key=self.openai_key,
                     )
                     chat_history = ChatMessageHistory()
-
+                    
+                    print("chat_id----==================chat id------", chat_id)
+                    print("modelName----==================model name------", modelName)
+                    print("max_output_tokens----==================max output tokens------", max_output_tokens) 
+                    
                     db = next(get_db())
-                    results = (
-                        db.query(ChatMessage)
-                        .filter(ChatMessage.chat_id == chat_id)
-                        .order_by(ChatMessage.id.desc())
-                        .limit(2)
-                        .all()
-                    )
-
+                    # Get recent chat messages from MongoDB
+                    results = get_chat_messages(db, str(chat_id), limit=2, skip=0)
+                    # Reverse to get most recent first
+                    results = list(reversed(results))
+                    print("results----==================results------", results)
+                    
                     # Format chat history
                     chat_history_text = "\n".join(
-                        [f"{'User' if not msg.is_bot else 'AI'}: {msg.message}" for msg in results]
+                        [f"{'User' if not msg['is_bot'] else 'AI'}: {msg['message']}" for msg in results]
                     )
+                    print("chat_history_text----==================chat history text------", chat_history_text)
 
                     chat_history_text += f"\nUser: {user_query}\n"
                     chat_history.add_user_message(user_query)
+                    
                     prompt = ChatPromptTemplate.from_messages(
                         [
                             f"""
@@ -169,25 +127,22 @@ class ResponseCreator:
                             - **Data-Driven Responses:** Use provided references when applicable.
                             - **Response Structure & Formatting:** Use paragraphs by default.
                             - **Language Consistency:** Respond in the same language as input ({language_code}).
-                            
-                            {f'Responses should align with the {industry_type} industry.' if not is_outside_from_industry else 'Responses are not restricted to any industry.'}  
                             """
                         ]
                     )
-
 
                     print("================INSIDE PROMPT===============")
                     MessagesPlaceholder(variable_name="messages")
                     chain = prompt | chat
                     completion = chain.astream({"messages": chat_history.messages})
                     response = await process_completion(completion)
+                    
                     if (
-                        response
-                        != "I'm having trouble right now. You can try again."
-                        and response
-                        != "Resources are busy. Please try again later."
+                        response != "I'm having trouble right now. You can try again."
+                        and response != "Resources are busy. Please try again later."
                     ):
                         main_response = response
+                        break
 
                 except asyncio.TimeoutError:
                     print("API call timed out.")
@@ -195,27 +150,14 @@ class ResponseCreator:
 
                 except openai.RateLimitError as e:
                     print("API Rate limit error", e)
-                    if (
-                        response
-                        == "I'm having trouble right now. You can try again."
-                    ):
+                    if response == "I'm having trouble right now. You can try again.":
                         response = "Resources are busy. Please try again later."
                     continue
 
                 except openai.OpenAIError:
                     continue
 
-                if (
-                    response
-                    != "I'm having trouble right now. You can try again."
-                    and response != "Resources are busy. Please try again later."
-                ):
-                    main_response = response
-                    break
-
             return main_response
-
-
 
         async def process_completion(completion) -> str:
             output_text = ""
@@ -224,7 +166,6 @@ class ResponseCreator:
             async for chunk in completion:
                 content = chunk.content or ""
                 output_text += content
-
             return output_text
 
         await handle_response()
@@ -495,24 +436,19 @@ class ResponseCreator:
                 )
 
                 chat_history = ChatMessageHistory()
-                db: Session = next(get_db())
+                db = next(get_db())
 
-                query = (
-                    db.query(ChatMessage)
-                    .filter(ChatMessage.chat_id == chat_id)
-                    .order_by(ChatMessage.id.desc())
-                    .limit(2)
-                ) 
-
-                results = query.all()
+                # Get recent chat messages from MongoDB
+                results = get_chat_messages(db, str(chat_id), limit=2, skip=0)
+                # Reverse to get most recent first
+                results = list(reversed(results))
 
                 chat_history_text = ""
                 for msg in results:
-                    msg_data = msg.to_dict()
-                    if not msg_data["is_bot"]:
-                        chat_history_text += f"User: {msg_data['message']}\n"
+                    if not msg["is_bot"]:
+                        chat_history_text += f"User: {msg['message']}\n"
                     else:
-                        chat_history_text += f"AI: {msg_data['message']}\n"
+                        chat_history_text += f"AI: {msg['message']}\n"
                             
                 chat_history_text += f"User: {user_query}\n"  
 
@@ -596,21 +532,18 @@ class ResponseCreator:
             )
             chat_history = ChatMessageHistory()
             db = next(get_db())
-            query = (
-                db.query(ChatMessage)
-                .filter(ChatMessage.chat_id ==chat_id)
-                .order_by(ChatMessage.id.desc())
-                .limit(2)
-            ) 
-
-            results = query.all()
+            
+            # Get recent chat messages from MongoDB
+            results = get_chat_messages(db, str(chat_id), limit=2, skip=0)
+            # Reverse to get most recent first
+            results = list(reversed(results))
  
             chat_history_text = ""
             for msg in results:
-                if not msg.to_dict()["is_bot"]:
-                    chat_history_text += f"User: {msg.to_dict()['message']}\n"
+                if not msg["is_bot"]:
+                    chat_history_text += f"User: {msg['message']}\n"
                 else:
-                    chat_history_text += f"AI: {msg.to_dict()['message']}\n"
+                    chat_history_text += f"AI: {msg['message']}\n"
                     
             chat_history_text += f"User: {user_query}\n"  
 
@@ -700,7 +633,7 @@ class ResponseCreator:
             return None
 
     async def get_response_from_langchain_if_answer_is_present_in_chat(
-        self, db: Session, chat_id: int, user_query: str
+        self, db, chat_id: int, user_query: str
     ):
         try:
             results = []
@@ -712,17 +645,16 @@ class ResponseCreator:
                 api_key=self.openai_key,
             )
 
-            query = db.query(ChatMessage).filter(ChatMessage.chat_id == chat_id)
-
-            results = query.all()
+            # Get all chat messages from MongoDB
+            results = get_chat_messages(db, str(chat_id), limit=100, skip=0)
 
             chat_history = ChatMessageHistory()
 
             for msg in results:
-                if msg.to_dict()["is_bot"]:
-                    chat_history.add_ai_message(msg.to_dict()["message"])
+                if msg["is_bot"]:
+                    chat_history.add_ai_message(msg["message"])
                 else:
-                    chat_history.add_user_message(msg.to_dict()["message"])
+                    chat_history.add_user_message(msg["message"])
 
             chat_history.add_user_message(user_query)
 
@@ -791,7 +723,7 @@ class ResponseCreator:
         user_question: str,
         bot_response: str,
     ) -> AsyncGenerator[str, None]:
-        from app.features.bot.websocket_response import WebSocketResponse as WR
+        from app.features.chat.websocket_manager import ChatWebSocketResponse as WR
 
         """Gets chat-based GPT response"""
 
@@ -800,16 +732,16 @@ class ResponseCreator:
         )
 
         res = self.gpt_response_with_stream(prompt)
-        await WR(
+        websocket_response = WR(
             chat_id=chat_id,
             websocket=websocket,
             connection_manager=connection_manager,
-        ).create_bot_response(
+        )
+        await websocket_response.create_streaming_response(
             res,
             None,
-            False,
-            None,
-            msg_type="followup_msg",
+            "followup_msg",
+            True
         )
 
     def generate_followup_question(

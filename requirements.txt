@@ -31,3 +31,6 @@ indic-transliteration
 yt-dlp
 faster-whisper
 openai-whisper
+translate
+rank-bm25
+sentry-sdk

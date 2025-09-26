@@ -8,6 +8,7 @@ class ChatCreate(BaseModel):
     """Schema for creating a new chat"""
     user_id: int = Field(..., description="ID of the user creating the chat")
     document_id: Optional[str] = Field(None, description="ID of the document this chat is related to")
+    training_doc_id: Optional[str] = Field(None, description="ID of the training document this chat is related to")
     title: str = Field(..., description="Title of the chat")
     status: str = Field(default="active", description="Status of the chat (active/inactive)")
 
@@ -16,6 +17,7 @@ class ChatUpdate(BaseModel):
     """Schema for updating a chat"""
     title: Optional[str] = Field(None, description="Title of the chat")
     status: Optional[str] = Field(None, description="Status of the chat (active/inactive)")
+    training_doc_id: Optional[str] = Field(None, description="ID of the training document this chat is related to")
 
 
 class ChatResponse(BaseModel):
@@ -45,6 +47,7 @@ class ChatMessageCreate(BaseModel):
     token: Optional[int] = Field(None, description="Token count for the message")
     type: Optional[str] = Field(default="text", description="Type of message (text, image, etc.)")
     is_edited: bool = Field(default=False, description="Whether the message has been edited")
+    training_doc_id: Optional[str] = Field(None, description="ID of the training document this message is related to")
 
 
 class ChatMessageUpdate(BaseModel):
@@ -52,6 +55,7 @@ class ChatMessageUpdate(BaseModel):
     message: Optional[str] = Field(None, description="The message content")
     reaction: Optional[str] = Field(None, description="Reaction to the message")
     is_edited: Optional[bool] = Field(None, description="Whether the message has been edited")
+    training_doc_id: Optional[str] = Field(None, description="ID of the training document this message is related to")
 
 
 class ChatMessageResponse(BaseModel):

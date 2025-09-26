@@ -84,9 +84,10 @@ class BotGraphMixin:
         collection: "Collection",
         model: "SentenceTransformer",
         questions: str,
-        mongo_document_id: int = None,
+        mongo_document_id: str = None,
     ):
         try:
+            print("questions>>>>>>>>in milvus>>>>>>>>>>>>>>",questions)
             encoded_embedding = model.encode(
                 questions, normalize_embeddings=True
             ).tolist()
@@ -94,7 +95,6 @@ class BotGraphMixin:
             search_params = {"metric_type": "IP"}
             filter_condition = None
             if mongo_document_id:
-                # If org_id is provided, use it in the filter
                 filter_condition = f"mongo_document_id == {mongo_document_id}"
 
             response: SearchResult = await sync_to_async(collection.search)(
@@ -188,19 +188,14 @@ class BotGraphMixin:
         """
         print("questions>>>>>>>>>>>>>>>>>>>>>>",questions)
         for question in questions:
-            response_long: SearchResult = await self._get_milvus_answer_response(
+            response_long = await self._get_milvus_answer_response(
                 collection, model, question, mongo_document_id
             )
             
             print("response_long:>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>", response_long)
             
             filtered_answers = await sync_to_async(self.find_filtered_answer)(
-                response_long,
-                (
-                    constants.MILVUS_DISTANCE_LIMIT_FOR_QUESTIONS
-                    if (collection == answers_msmarcos_collection)
-                    else constants.MILVUS_DISTANCE_LIMIT
-                ),
+                response_long
             )
             
             print("answer_ids:>>>>>>>>>>>>>>>>>>>>>>>>>_search_answers_vector>>>>>>>>>>>>>>>>>", filtered_answers)            
@@ -223,7 +218,7 @@ class BotGraphMixin:
         return filtered_answer_ids
     
     
-    def find_filtered_answer(self, response, distance_limit):
+    def find_filtered_answer(self, response):
         contexts = []
         
         if len(response) and len(response[0]):
@@ -237,36 +232,6 @@ class BotGraphMixin:
 
    
 
-    async def search_questions(
-        self, questions: list[str], collection: "Collection", org_id: int
-    ) -> list[str] | None:
-        """
-        Searches for relevant questions to respond to the user.
-
-        :param questions: List of user questions to search for
-        :param collection: Milvus collection to query
-        :param org_id: Organization ID for contextual filtering
-        :return: List of search results, or None if no results found
-        """
-        # Guard clause for empty input
-        if not questions:
-            logger.warning("No questions provided for search.")
-            return None
-
-        try:
-            # Perform the vector search
-            msmarco_results = await self._search_questions_vector(
-                collection, msmarco_model, questions, org_id
-            )
-
-            # Return the results if found
-            return msmarco_results if msmarco_results else None
-
-        except Exception as e:
-            # Log and handle exceptions gracefully
-            logger.error(f"Error in search_questions: {e}")
-            capture_exception(e)
-            return None
 
     
     async def search_answers(

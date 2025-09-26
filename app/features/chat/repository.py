@@ -26,6 +26,7 @@ class ChatRepository:
         chat_doc = {
             "user_id": chat_data.user_id,
             "document_id": ObjectId(chat_data.document_id) if chat_data.document_id else None,
+            "training_doc_id": ObjectId(chat_data.training_doc_id) if chat_data.training_doc_id else None,
             "title": chat_data.title,
             "status": chat_data.status,
             "created_at": datetime.now(),
@@ -100,6 +101,7 @@ class ChatRepository:
             "token": message_data.token,
             "type": message_data.type,
             "is_edited": message_data.is_edited,
+            "training_doc_id": ObjectId(message_data.training_doc_id) if message_data.training_doc_id else None,
             "created_ts": datetime.now(),
             "updated_ts": datetime.now()
         }
@@ -136,6 +138,7 @@ class ChatRepository:
             "token": message_data.token,
             "type": message_data.type,
             "is_edited": message_data.is_edited,
+            "training_doc_id": ObjectId(message_data.training_doc_id) if message_data.training_doc_id else None,
             "created_ts": datetime.now(),
             "updated_ts": datetime.now()
         }

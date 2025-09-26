@@ -43,7 +43,7 @@ from app.database.mongo_collections import (
 )
 from bson import ObjectId
 from app.schemas.milvus.collection.milvus_collections import chunk_msmarcos_collection
-from app.schemas.schemas import DocSathiAIDocumentCreate
+from app.schemas.schemas import DocSathiAIDocumentBase, DocSathiAIDocumentCreate
 from datetime import datetime
 import asyncio
 
@@ -222,6 +222,80 @@ async def read_and_train_private_file(
             "success": False,
             "error": str(e),
         }
+
+
+async def get_documents_by_user_id(userId: str):
+    try:
+        db = next(get_db())
+        print("userId----------", userId)
+        query = {"user_id": int(userId)}
+
+        documents = list(db["docSathi_ai_documents"].find(query).sort("created_ts", -1))
+
+        # Convert ObjectId to str
+        for doc in documents:
+            doc["_id"] = str(doc["_id"])
+
+        if documents:
+            return {
+                "data": documents,
+                "success": True,
+                "message": "Documents retrieved successfully.",
+            }
+
+        return {
+            "data": [],
+            "success": False,
+            "message": "No documents found.",
+        }
+
+    except Exception as e:
+        print("error in get_documents_by_user_id", e)
+        capture_exception(e)
+        return {"message": "Something went wrong", "success": False}
+
+async def check_doc_status(document_ids):
+    db = next(get_db())
+    try:
+        documents = db["docSathi_ai_documents"].find({"_id": {"$in": document_ids}})
+        documents = list(documents)
+
+        if not documents:
+            return {
+                "success": False,
+                "message": "No documents found",
+                "data": [],
+            }
+
+        # Check agar koi bhi document processing me hai
+        for document in documents:
+            if document["status"] == "processing":
+                return {
+                    "success": False,
+                    "message": "Documents are still processing",
+                    "data": [],
+                }
+
+        # Agar koi bhi processing me nahi mila
+        return {
+            "success": True,
+            "message": "Documents are processed successfully",
+            "data": documents,
+        }
+
+    except Exception as e:
+        print("error in check_document_status", e)
+        capture_exception(e)
+        return {
+            "success": False,
+            "message": "Something went wrong",
+            "data": [],
+        }
+
+
+    
+
+
 
 
 async def process_single_file(file_data, document_format, doc_type):
