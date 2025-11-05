@@ -159,14 +159,16 @@ async def create_chat_message(
     """Create a new message in a chat"""
     try:
         chat_repo = ChatRepository()
-        
+        print(">>>>>>>>>>>>>>>>>================chat  id in create_chat_message>>>>>>>>>>>>>>>>>",chat_id)
         # Check if chat exists
         chat = await chat_repo.get_chat_by_id(chat_id)
+        print("chat>>>>>>>>>>>>>>>>>>>in create_chat_message=======>",chat)
         if not chat:
             raise HTTPException(status_code=404, detail="Chat not found")
         
         # Set chat_id in message data
         message_data.chat_id = chat_id
+        print("message_data>>>>>>>>>>>>>>>>>>>in create_chat_message=======>",message_data)
         
         message_id = await chat_repo.create_chat_message(message_data)
         return {
@@ -387,6 +389,7 @@ async def websocket_endpoint(websocket: WebSocket, chat_id: str):
 
         while True:
             data = await websocket.receive_text()
+            print("data>>>>>>>>>vmvm,mxv,mx>>>>>2 in router>>>>>chatid>>>before process data>>>>>>>",chat_id)
             await process_received_data(data, chat_id, current_time, is_error, websocket)
 
     except WebSocketDisconnect as e:
@@ -419,6 +422,7 @@ async def process_received_data(data: str, chat_id: str, current_time: str, is_e
             # Check if chat exists in MongoDB
             chat_repo = ChatRepository()
             chat = await chat_repo.get_chat_by_id(chat_id)
+            print("chat>>>>>>>>>vmvm,mxv,mx>>>>>2 in router>>>>>chat>>>>>>>>>>",chat)
             if not chat:
                 await handle_invalid_chat_id(websocket, chat_id)
                 return
@@ -483,6 +487,23 @@ async def handle_message_upload(received_data: dict, chat_id: str, current_time:
         timezone = received_data.get("timezone", "UTC")
         language_code = received_data.get("selectedLanguage", "en")
         document_id = received_data.get("documentId", "")
+        use_web_search = received_data.get("useWebSearch", False)  # Extract web search flag
+        
+        # Check message length limit - increase from 500 to 2000 characters
+        MAX_MESSAGE_LENGTH = 2000
+        if len(message) > MAX_MESSAGE_LENGTH:
+            error_msg = f"QUERY LENGTH LIMIT EXCEEDED. MAX ALLOWED QUERY: {MAX_MESSAGE_LENGTH} CHARS"
+            await websocket_manager.send_personal_message(
+                websocket,
+                {
+                    "mt": "error",
+                    "chatId": chat_id,
+                    "message": error_msg,
+                    "timestamp": datetime.now().isoformat(),
+                }
+            )
+            return
+        
         # Generate token for user message
         current_time_ms = int(datetime.now().timestamp() * 1000)
         user_message_token = f"{current_time_ms}_{chat_id}"
@@ -521,9 +542,12 @@ async def handle_message_upload(received_data: dict, chat_id: str, current_time:
             language_code=language_code
         )
         
-        # Generate bot response
-        success = await bot_message.send_bot_message(message)
+        # Log web search flag
+        print(f"🔍 Web Search Flag: {use_web_search} ({'ENABLED' if use_web_search else 'DISABLED - Document Only'})")
         
+        # Generate bot response with web search flag
+        success = await bot_message.send_bot_message(message, use_web_search=use_web_search)
+        print("success>>>>>>>>>vmvm,mxv,mx>>>>>2 in router>>>>>>>>>>>>>>>",success)
         if not success:
             # Send error message
             error_message = "I'm having trouble right now. You can try again."

@@ -117,7 +117,8 @@ def start_fastapi():
             'app.main:app', 
             '--reload', 
             '--host', '0.0.0.0', 
-            '--port', '5000'
+            '--port', '5000',
+            '--log-level', 'info'
         ])
         
     except KeyboardInterrupt:

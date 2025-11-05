@@ -31,5 +31,32 @@ class Settings:
     # File upload settings
     MAX_FILE_SIZE: int = int(os.getenv('MAX_FILE_SIZE', '50000000'))  # 50MB
     ALLOWED_EXTENSIONS: list = ['pdf', 'doc', 'docx', 'txt', 'ppt', 'pptx']
+    
+    # Authentication settings
+    JWT_SECRET_KEY: str = os.getenv('JWT_SECRET_KEY', 'your-secret-key-change-in-production')
+    JWT_ALGORITHM: str = os.getenv('JWT_ALGORITHM', 'HS256')
+    ACCESS_TOKEN_EXPIRE_MINUTES: int = int(os.getenv('ACCESS_TOKEN_EXPIRE_MINUTES', '1440'))  # 24 hours
+    REFRESH_TOKEN_EXPIRE_DAYS: int = int(os.getenv('REFRESH_TOKEN_EXPIRE_DAYS', '30'))
+    
+    # OTP settings
+    OTP_LENGTH: int = int(os.getenv('OTP_LENGTH', '6'))
+    OTP_EXPIRE_MINUTES: int = int(os.getenv('OTP_EXPIRE_MINUTES', '5'))
+    
+    # Email settings
+    SENDER_EMAIL: str = os.getenv('SENDER_EMAIL', 'naveen.sharma@vaktaai.com')
+    EMAIL_VERIFICATION_EXPIRE_MINUTES: int = int(os.getenv('EMAIL_VERIFICATION_EXPIRE_MINUTES', '10'))
+    
+    # SMS settings (placeholder for future SMS service integration)
+    SMS_SERVICE_ENABLED: bool = os.getenv('SMS_SERVICE_ENABLED', 'false').lower() == 'true'
+    
+    # MongoDB settings
+    MONGO_URI: str = os.getenv('MONGO_URI', 'mongodb://localhost:27017')
+    MONGO_DB_NAME: str = os.getenv('MONGO_DB_NAME', 'vakta_ai')
+    
+    # AI Service API Keys
+    GROQ_API_KEY: Optional[str] = os.getenv('GROQ_API_KEY')
+    GROQ_MODEL: str = os.getenv('GROQ_MODEL', 'llama-3.1-70b-versatile')
+    OPENAI_API_KEY: Optional[str] = os.getenv('OPENAI_API_KEY')
+    OPENAI_MODEL: str = os.getenv('OPENAI_MODEL', 'gpt-4o-mini')
 
 settings = Settings()

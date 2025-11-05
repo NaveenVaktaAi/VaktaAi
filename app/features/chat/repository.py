@@ -5,7 +5,8 @@ from app.database.session import get_db
 from app.database.mongo_collections import (
     create_chat, get_chat, get_user_chats, update_chat, delete_chat,
     create_chat_message, get_chat_messages, get_chat_message, 
-    update_chat_message, delete_chat_message, get_chat_message_count
+    update_chat_message, delete_chat_message, get_chat_message_count,
+    get_collections
 )
 from app.features.chat.schemas import (
     ChatCreate, ChatUpdate, ChatResponse, ChatMessageCreate, 
@@ -27,7 +28,7 @@ class ChatRepository:
             "user_id": chat_data.user_id,
             "document_id": ObjectId(chat_data.document_id) if chat_data.document_id else None,
             "training_doc_id": ObjectId(chat_data.training_doc_id) if chat_data.training_doc_id else None,
-            "title": chat_data.title,
+            "title": "",
             "status": chat_data.status,
             "created_at": datetime.now(),
             "updated_at": datetime.now()
@@ -38,7 +39,7 @@ class ChatRepository:
         """Get a chat by ID"""
         return get_chat(self.db, chat_id)
 
-    async def get_user_chats(self, user_id: int, page: int = 1, limit: int = 20) -> ChatListResponse:
+    async def get_user_chats(self, user_id: int, page: int = 1, limit: int = 10) -> ChatListResponse:
         """Get all chats for a user with pagination"""
         skip = (page - 1) * limit
         chats = get_user_chats(self.db, user_id)
@@ -74,7 +75,7 @@ class ChatRepository:
         if chat_data.title is not None:
             update_fields["title"] = chat_data.title
         if chat_data.status is not None:
-            update_fields["status"] = chat_data.status
+            update_fields["status"] = "active"
             
         if update_fields:
             update_fields["updated_at"] = datetime.now()
@@ -93,22 +94,57 @@ class ChatRepository:
 
     async def create_chat_message(self, message_data: ChatMessageCreate) -> str:
         """Create a new chat message"""
-        message_doc = {
-            "chat_id": ObjectId(message_data.chat_id),
-            "message": message_data.message,
-            "is_bot": message_data.is_bot,
-            "reaction": message_data.reaction,
-            "token": message_data.token,
-            "type": message_data.type,
-            "is_edited": message_data.is_edited,
-            "training_doc_id": ObjectId(message_data.training_doc_id) if message_data.training_doc_id else None,
-            "created_ts": datetime.now(),
-            "updated_ts": datetime.now()
-        }
-        message_id = create_chat_message(self.db, message_doc)
+        try:
+            # Check for recent duplicate before creating
+            from datetime import timedelta
+            recent_time = datetime.now() - timedelta(seconds=5)
+            
+            existing = list(self.db["chat_messages"].find({
+                "chat_id": ObjectId(message_data.chat_id),
+                "message": message_data.message,
+                "is_bot": message_data.is_bot,
+                "created_ts": {"$gte": recent_time}
+            }).limit(1))
+            
+            if existing:
+                print(f"[DEBUG] Duplicate detected in repository, returning existing: {existing[0]['_id']}")
+                return str(existing[0]["_id"])
+            print("create chat message>>>>>>>>>>>>>>>>>>>in create_chat_message chat_id=======>",message_data.chat_id)
+            message_doc = {
+                "chat_id": ObjectId(message_data.chat_id),
+                "message": message_data.message,
+                "is_bot": message_data.is_bot,
+                "reaction": message_data.reaction,
+                "token": message_data.token,
+                "type": message_data.type,
+                "is_edited": message_data.is_edited,
+                "training_doc_id": ObjectId(message_data.training_doc_id) if message_data.training_doc_id else None,
+                "created_ts": datetime.now(),
+                "updated_ts": datetime.now()
+            }
+            message_id = create_chat_message(self.db, message_doc)
+            print(f"[DEBUG] New message created in repository: {message_id}")
+            
+            # Update chat title if this is the first user message
+            if not message_data.is_bot:
+                await self._update_chat_title_if_first_user_message(message_data.chat_id, message_data.message)
+        except Exception as e:
+            print(f"[ERROR] Error creating message: {e}")
+            # If error occurs, try to find existing message
+            existing = list(self.db["chat_messages"].find({
+                "chat_id": ObjectId(message_data.chat_id),
+                "message": message_data.message,
+                "is_bot": message_data.is_bot
+            }).sort("created_ts", -1).limit(1))
+            
+            if existing:
+                return str(existing[0]["_id"])
+            raise e
         
         # Send WebSocket notification if manager is available
-        if self.websocket_manager:
+        # BUT skip for bot messages since they are already streamed to frontend
+        if self.websocket_manager and not message_data.is_bot:
+            print(f"[DEBUG] Sending websocket notification for user message: {message_id}")
             await self.websocket_manager.send_to_chat(
                 message_data.chat_id,
                 {
@@ -120,8 +156,39 @@ class ChatRepository:
                     "timestamp": datetime.now().isoformat(),
                 }
             )
+        elif message_data.is_bot:
+            print(f"[DEBUG] Skipping websocket notification for bot message (already streamed): {message_id}")
         
         return message_id
+
+    async def _update_chat_title_if_first_user_message(self, chat_id: str, message: str):
+        """Update chat title and status to active if this is the first user message"""
+        try:
+            # Check if this is the first user message for this chat
+            user_message_count = self.db["chat_messages"].count_documents({
+                "chat_id": ObjectId(chat_id),
+                "is_bot": False
+            })
+            
+            print(f"[DEBUG] Chat {chat_id} has {user_message_count} user messages")
+            
+            # If this is the first user message (count = 1), update chat title
+            if user_message_count == 1:
+                # Create title from first 50 characters of the message
+                title = message[:50] + "..." if len(message) > 50 else message
+                
+                # Update chat title and status to active
+                update_chat(self.db, chat_id, {
+                    "title": title,
+                    "status": "active",
+                    "updated_at": datetime.now()
+                })
+                print(f"[DEBUG] Updated chat {chat_id} - title: {title}, status: active")
+                
+        except Exception as e:
+            print(f"[ERROR] Error updating chat title: {e}")
+            import traceback
+            traceback.print_exc()
 
     async def create_chat_message_with_websocket(
         self, 
@@ -143,6 +210,10 @@ class ChatRepository:
             "updated_ts": datetime.now()
         }
         message_id = create_chat_message(self.db, message_doc)
+        
+        # Update chat title if this is the first user message
+        if not message_data.is_bot:
+            await self._update_chat_title_if_first_user_message(message_data.chat_id, message_data.message)
         
         # Send WebSocket notification
         if websocket_response:
@@ -175,14 +246,52 @@ class ChatRepository:
             message_responses.append(ChatMessageResponse(
                 _id=str(message["_id"]),
                 chat_id=str(message["chat_id"]),
-                message=message["message"],
-                is_bot=message["is_bot"],
+                message=message.get("message", ""),
+                is_bot=message.get("is_bot", False),
                 reaction=message.get("reaction"),
                 token=message.get("token"),
                 type=message.get("type", "text"),
                 is_edited=message.get("is_edited", False),
-                created_ts=message["created_ts"],
-                updated_ts=message["updated_ts"]
+                created_ts=message.get("created_ts"),
+                updated_ts=message.get("updated_ts")
+            ))
+        
+        return message_responses
+
+    async def get_last_chat_messages(self, chat_id: str, limit: int = 2, skip_latest: int = 1) -> List[Dict[str, Any]]:
+        """Get last N messages for a chat, skipping the most recent ones
+        
+        Args:
+            chat_id: Chat ID
+            limit: Number of messages to fetch (default: 2)
+            skip_latest: Number of latest messages to skip (default: 1 - skips current user message)
+        """
+        from bson import ObjectId
+        
+        # Get last N messages in descending order (newest first), skipping the latest
+        _, _, _, chat_messages, _, _ = get_collections(self.db)
+        messages = list(chat_messages.find({"chat_id": ObjectId(chat_id)})
+                       .sort("created_ts", -1)  # Descending - newest first
+                       .skip(skip_latest)  # Skip the latest message(s)
+                       .limit(limit))
+        
+        # Reverse to get chronological order (oldest to newest)
+        messages.reverse()
+        
+        # Convert to response format
+        message_responses = []
+        for message in messages:
+            message_responses.append(ChatMessageResponse(
+                _id=str(message["_id"]),
+                chat_id=str(message["chat_id"]),
+                message=message.get("message", ""),
+                is_bot=message.get("is_bot", False),
+                reaction=message.get("reaction"),
+                token=message.get("token"),
+                type=message.get("type", "text"),
+                is_edited=message.get("is_edited", False),
+                created_ts=message.get("created_ts"),
+                updated_ts=message.get("updated_ts")
             ))
         
         return message_responses

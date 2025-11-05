@@ -2,11 +2,11 @@ fastapi
 uvicorn
 websockets
 boto3
-pymilvus
+pymilvus==2.3.7
 sentence-transformers
 langchain
-langgraph
 pypdf2
+pdfplumber
 python-docx
 python-pptx
 python-multipart
@@ -29,8 +29,18 @@ redis
 youtube-transcript-api
 indic-transliteration
 yt-dlp
-faster-whisper
-openai-whisper
-translate
+deep-translator
 rank-bm25
-sentry-sdk
+sentry-sdk  
+tavily-python
+bcrypt
+email-validator
+passlib
+pydantic
+phonenumbers
+pydantic[email]
+jwt
+# edge-tts  # Replaced with AWS Polly
+boto3  # AWS Polly for TTS with phonemes
+phonemizer
+g2p-en

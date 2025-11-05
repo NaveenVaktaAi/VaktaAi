@@ -4,6 +4,8 @@ import logging
 import re
 from datetime import datetime
 from typing import Optional, Dict, Any, List
+import hashlib
+from functools import lru_cache
 from fastapi import WebSocket
 import numpy as np
 from sqlalchemy import Integer, func, or_
@@ -13,13 +15,23 @@ from app.schemas.milvus.collection.milvus_collections import chunk_msmarcos_coll
 from app.schemas.schemas import ChunkBase, DocSathiAIDocumentBase
 from rank_bm25 import BM25Okapi
 from nltk.tokenize import word_tokenize
-from translate import Translator
+# from translate import Translator  # Replaced with OpenAI translation
+from deep_translator import GoogleTranslator
 
 from app.features.chat.repository import ChatRepository
 from app.features.chat.websocket_manager import ChatWebSocketResponse
 from app.features.chat.schemas import ChatMessageCreate
 from app.database.session import get_db
 from app.features.chat.semantic_search import BotGraphMixin
+from langchain_community.tools import DuckDuckGoSearchResults
+
+import os
+from langchain_community.tools.tavily_search import TavilySearchResults
+TAVILY_API_KEY="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"
+tool=TavilySearchResults(tavily_api_key=TAVILY_API_KEY)
+from tavily import TavilyClient
+
+tavily = TavilyClient(api_key=TAVILY_API_KEY)
 
 
 logger = logging.getLogger(__name__)
@@ -49,63 +61,201 @@ class MongoDBBotHandler:
         self.time_zone = time_zone
         self.language_code = language_code
         self.db = next(get_db())
+        # Simple in-memory cache for frequent queries
+        self._query_cache = {}
+        self._cache_max_size = 100
 
-    async def handle_user_message(self, user_message: str) -> bool:
+    async def handle_user_message(self, user_message: str, use_web_search: bool = False) -> bool:
         """
         Handle a user message with full RAG functionality.
         Adapted from the bot system's bot_handler method.
+        
+        Args:
+            user_message: The user's message
+            use_web_search: Whether to enable web search (default: False, uses only document RAG)
         """
         try:
-            # Create user message in MongoDB
+            # Debug: Check if user message already exists to prevent duplicates
+            print(f"[DEBUG] Attempting to save user message: '{user_message}' for chat: {self.chat_id}")
             
-            user_message_data = ChatMessageCreate(
-                chat_id=self.chat_id,
-                message=user_message,
-                is_bot=False,
-                type="text"
+            # Check for recent duplicate within last 5 seconds
+            from datetime import datetime, timedelta
+            recent_time = datetime.now() - timedelta(seconds=5)
+            
+            existing_messages = await self.chat_repository.get_chat_messages(
+                self.chat_id, page=1, limit=5
             )
             
-            user_message_id = await self.chat_repository.create_chat_message(user_message_data)
-            logger.info(f"User message created: {user_message_id}")
+            # Check if this exact message was saved recently
+            for msg in existing_messages:
+                if (msg.message == user_message and 
+                    msg.created_ts and 
+                    msg.created_ts > recent_time):
+                    print(f"[DEBUG] Duplicate user message detected, skipping save: {msg.id}")
+                    user_message_id = msg.id
+                    break
+            else:
+                # Create user message in MongoDB
+                print(f"[DEBUG] Creating new user message in database")
+                user_message_data = ChatMessageCreate(
+                    chat_id=self.chat_id,
+                    message=user_message,
+                    is_bot=False,
+                    type="text"
+                )
+                
+                user_message_id = await self.chat_repository.create_chat_message(user_message_data)
+                logger.info(f"User message created: {user_message_id}")
 
+            # nornal_response = await self.get_normal_response(user_message)
+            # if nornal_response:
+            #     return True
             # Check for auto-replies first (greetings, thanking, confirmation)
-            if await self.auto_reply_handler(user_message, "greeting"):
-                return True
-            if await self.auto_reply_handler(user_message, "thanking"):
-                return True
-            if await self.auto_reply_handler(user_message, "confirmation"):
-                return True
-        
+            # if await self.auto_reply_handler(user_message, "greeting"):
+            #     return True
+            # if await self.auto_reply_handler(user_message, "thanking"):
+            #     return True
+            # if await self.auto_reply_handler(user_message, "confirmation"):
+            #     return True
+            chat_history_text = "There is no chat history"    
+            chat_history_text = await self.get_chat_history()
+            raw = await self.get_goforward_decision_and_response(user_message, chat_history_text)
+            
+            # Parse the raw response to get goforward decision
+            try:
+                if not raw or raw.strip() == "":
+                    print("Empty response from goforward decision, continuing with RAG")
+                    raise ValueError("Empty response")
+                
+                # Clean the response to extract JSON
+                json_text = raw.strip()
+                if json_text.startswith('```json'):
+                    json_text = json_text[7:]
+                if json_text.endswith('```'):
+                    json_text = json_text[:-3]
+                json_text = json_text.strip()
+                
+                # Parse JSON
+                parsed_response = json.loads(json_text)
+                
+                # Check if goforward is false
+                if not parsed_response.get("goforward", True):
+                    # Use the immediate response from decision function
+                    immediate_response = parsed_response.get("response", "")
+                    if immediate_response:
+                        print(f"💬 Using immediate response (goforward=False): {immediate_response}")
+                        
+                        # Create ultra-fast streaming generator for immediate response
+                        async def string_to_generator(data):
+                            chunk_size = 10  # Chunk size for streaming
+                            delay = 0.01  # Small delay for smooth streaming
+                            for i in range(0, len(data), chunk_size):
+                                chunk = data[i:i+chunk_size]
+                                yield chunk
+                                await asyncio.sleep(delay)
+                        
+                        generator = string_to_generator(immediate_response)
+                        print(f"🎬 Starting immediate response streaming...")
+                        
+                        # Send immediate response and get final text (immediate responses are AI-generated)
+                        final_response = await self.websocket_response.create_streaming_response(
+                            generator,
+                            f"immediate_{datetime.now().timestamp()}",
+                            True,
+                            citation_source="ai"  # ✅ Immediate responses are AI-generated
+                        )
+                        
+                        # Save bot message to database after streaming completes
+                        try:
+                            bot_message_data = ChatMessageCreate(
+                                chat_id=self.chat_id,
+                                message=final_response,
+                                is_bot=True,
+                                type="text"
+                            )
+                            bot_message_id = await self.chat_repository.create_chat_message(bot_message_data)
+                            print(f"💾 Immediate response saved to DB: {bot_message_id}")
+                        except Exception as save_error:
+                            print(f"⚠️ Error saving immediate response to DB: {save_error}")
+                        
+                        return True
+                    else:
+                        print("No immediate response provided, continuing with RAG")
+                
+                # If goforward=True, continue with RAG processing
+                print(f"Proceeding with RAG (goforward=True)")
+                
+            except (json.JSONDecodeError, ValueError) as parse_error:
+                print(f"JSON parsing failed: {parse_error}")
+                print(f"Raw response was: {raw}")
+                # Fallback: continue with RAG processing
+            except Exception as e:
+                print(f"Error in goforward decision processing: {e}")
+                # Fallback: continue with RAG processing
             
             # Process user input for keywords and language detection
-            message_response = (
-                await self.get_multi_response_from_gpt_based_on_user_input(
-                    user_input=user_message,
+            try:
+                message_response = (
+                    await self.get_multi_response_from_gpt_based_on_user_input(
+                        user_input=user_message,
+                        chat_history_text=chat_history_text,
+                    )
                 )
-            )
             
-            chat_history_flag = False
-            if message_response:
-                message_data = self.extract_json_from_text(message_response)
-                processed_user_message = message_data["translated_input"]
-                language_code = message_data["language_code"]
-                chat_history_flag = message_data["follow_up"]
+                processed_user_message = user_message  # Default to original message
+                language_code = "en"  # Default language
+                detected_language = "English"  # Default language
                 
+                if message_response:
+                        try:
+                            message_data = self.extract_json_from_text(message_response)
+                            processed_user_message = message_data.get("translated_input", user_message)
+                            language_code = message_data.get("language_code", "en")
+                            detected_language = message_data.get("detected_language", "English")
+                    
                 # Update language code if detected
-                self.language_code = language_code
+                            self.language_code = language_code
+                        except Exception as lang_error:
+                            print(f"Error in language detection: {lang_error}")
+                        # Use defaults
+                        
+            except Exception as e:
+                print(f"Error in message processing: {e}")
+                processed_user_message = user_message
+                language_code = "en"
+                detected_language = "English"
+            # Start web search in parallel ONLY if enabled by user
+            web_search_task = None
+            if use_web_search:
+                print("🌐 Web Search ENABLED - Starting parallel web search...")
+                
+                async def fetch_web_results():
+                    try:
+                        # Run web search in thread pool since tool.invoke() is sync
+                        import asyncio
+                        loop = asyncio.get_event_loop()
+                        results = await loop.run_in_executor(None, tool.invoke, processed_user_message)
+                        if results:
+                            print("results>>>>>>>tavily>>>>>>>>>>>>>>>>>>>>>>", results[0].get('title', 'No title'))
+                            print("results>>>>>>>content>>>>>>>>>>>>>>>>>>>>>>", results[0].get('content', 'No content'))
+                        return results
+                    except Exception as e:
+                        print(f"Error fetching web search results: {e}")
+                        return []
+                
+                # Start web search task immediately
+                web_search_task = asyncio.create_task(fetch_web_results())
+            else:
+                print("📄 Document-Only Mode - Web search DISABLED (using RAG only)")
             
-            # Handle chat history for follow-up questions
-            if chat_history_flag:
-                chat_history_text = await self.get_chat_history()
-                if chat_history_text:
-                    user_message = f"{user_message}\nChat history: {chat_history_text}"
-
-            # Process bot response with RAG
+            # Process bot response with RAG (this will also run in parallel)
             is_result_found = await self.process_bot_response(
                 self.db, 
-                processed_user_message, 
-                # is_outside_from_document,\
-                language_code
+                processed_user_message,
+                language_code,
+                detected_language,
+                web_search_task,  # Pass the task, not the results yet
+                use_web_search=use_web_search  # ✅ Pass web search flag for citation logic
             )
             
             if is_result_found:
@@ -115,206 +265,211 @@ class MongoDBBotHandler:
                 
         except Exception as e:
             logger.error(f"Error in handle_user_message: {e}")
+            print(f"Error in handle_user_message: {e}")
             await self.send_error_response(str(e))
             return True
 
-    # Auto-reply functionality from bot system
-    async def auto_reply_handler(self, last_user_text: str, auto_reply_type: str) -> bool:
+
+
+    async def get_goforward_decision_and_response(
+            self,
+            user_input: str,
+            chat_history_text: str
+        ) -> Dict[str, Any]:
         """
-        Handles if the bot can reply directly to the user.
-        Adapted from the bot system.
+        Ask the LLM to decide whether to proceed to RAG or handle immediately.
+
+        Returns a dict with keys:
+        - goforward: bool
+        - response: str | None
+        - detected_language: str
+        - language_code: str
+        - translated_input: str
+
+        Behavior:
+        - Single LLM call, strict JSON-only output required from LLM.
+        - If parsing fails or LLM output doesn't conform, returns conservative fallback: goforward=True.
         """
-        print(f"LAST_USER_TEXT {last_user_text}\n")
+        if not user_input or not user_input.strip():
+            return {
+                "goforward": True,
+                "response": None,
+                "detected_language": "unknown",
+                "language_code": "",
+                "translated_input": ""
+            }
 
-        # Determine if the bot should auto-reply
-        should_auto_reply = False
-        if auto_reply_type == "greeting":
-            should_auto_reply = await self.check_message_auto_reply(last_user_text)
-        elif auto_reply_type == "thanking":
-            should_auto_reply = await self.check_appreciation_message_auto_reply(last_user_text)
-        elif auto_reply_type == "confirmation":
-            should_auto_reply = await self.check_confirmation_message_auto_reply(last_user_text)
-        elif auto_reply_type == "normal_chat":
-            should_auto_reply = await self.check_normal_chat_message_auto_reply(last_user_text)
-            print(f"SHOULD_AUTO_REPLY normal chat ---------- {should_auto_reply}\n")
-        print(f"AUTO_REPLY_TYPE {auto_reply_type}, SHOULD_AUTO_REPLY {should_auto_reply}\n")
+        system_prompt = f"""
+    You are a classifier+assistant. Inspect the provided chat_history (the last two messages: previous user message and previous assistant reply) and the new user message.
+    Decide whether the user's message should be handled immediately by a short assistant reply (auto-reply) OR escalated to the retrieval/RAG pipeline.
 
-        if not should_auto_reply:
-            return False
-        
-        # Set response type and message based on the auto-reply type
-        if auto_reply_type == "greeting":
-            msg_type = "greetings_msg"
-            msg = self.create_greetings_response()
-        elif auto_reply_type == "thanking":
-            msg_type = "thanking_msg"
-            msg = self.create_thanking_response()
-        elif auto_reply_type == "confirmation":
-            msg_type = "confirmation_msg"
-            msg = self.create_confirmation_response()
+    REQUIREMENTS:
+    - Use user_input and chat_history_text to resolve references when needed.
+    - Detect language (English, Hindi, Hinglish, Marathi, Gujarati).
+    - Produce a concise English normalized query in 'translated_input' that combines current user_input and the last two messages if necessary.
 
-        # Send the bot's response
-        await self.websocket_response.create_streaming_response(
-            msg, 
-            f"auto_reply_{auto_reply_type}",
-            "public",
-            True
+    OUTPUT RULES (MUST FOLLOW EXACTLY):
+    Return ONLY ONE valid JSON object (no explanations, no markdown, no code fences) with these keys:
+
+    {{
+    "goforward": true|false,              // true -> caller should run RAG; false -> LLM's 'response' can be used immediately
+    "response": "<short reply or null>", // if goforward=false, provide a short conversational response (<= 40 tokens). If goforward=true, set null.
+    "detected_language": "<language name>",
+    "language_code": "<ISO 639-1 code>",
+    "translated_input": "<combined, standardized English query>"
+    }}
+
+    GUIDELINES:
+    - If the user's message is casual chit-chat, greetings, thanks, or a short acknowledgement and does not require retrieval, set goforward=false and provide a short response.
+    - If the user asks an informational/factual question, requests detailed steps, or continues a prior informational thread (follow-up), set goforward=true and set response to null.
+    - If ambiguous, you may either (A) set goforward=false and include a short clarification in 'response', or (B) set goforward=true and leave response null. Use your judgment.
+    - No chain-of-thought. Keep response short and helpful.
+
+    EXAMPLES (ONLY JSON):
+    # Greeting -> handle locally
+    {{"goforward": false, "response": "Hi! How can I help you today?", "detected_language":"English", "language_code":"en", "translated_input": "User greets the assistant."}}
+
+    # Follow-up informational -> go to RAG
+    {{"goforward": true, "response": null, "detected_language":"Hindi", "language_code":"hi", "translated_input": "Is the vaccination slot open today for Pune?"}}
+    """
+
+        user_payload = (
+            f"CHAT_HISTORY_LAST_TWO:\n{chat_history_text}\n\n"
+            f"USER_INPUT:\n{user_input}\n\n"
+            "Respond with the single JSON object described above and nothing else."
         )
 
-        return True
-
-    async def check_message_auto_reply(self, user_input: str) -> bool:
-        """Check if message is a greeting using GPT"""
         prompt = [
-            {
-                "role": "system",
-                "content": (
-                    "You are an assistant that determines whether a user's input is a casual greeting or conversational statement. "
-                    "Return 'true' if the input is a standalone greeting (e.g., 'Hi', 'Hello', 'Hey', 'What's up') or a greeting followed by casual conversation (e.g., 'Hi, how are you?', 'Hello, what's up?'). "
-                    "Return 'false' if the input is a greeting followed by an informational or factual question (e.g., 'Hi, what is bike insurance?', 'Hello, what is banking?'). "
-                    "Only respond with 'true' or 'false'."
-                ),
-            },
-            {
-                "role": "user",
-                "content": user_input,
-            },
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_payload}
         ]
-        gpt_res = await ResponseCreator().gpt_response_without_stream(prompt)
-        return gpt_res.strip().lower() == "true"
-    
-    async def check_confirmation_message_auto_reply(self, user_input: str) -> bool:
-        """Check if message is a confirmation using GPT"""
-        prompt = [
-            {
-                "role": "system",
-                "content": (
-                    "You are an assistant that determines whether a user's input is an Acknowledgment or Confirmation Response. "
-                    "An Acknowledgment/Confirmation Response includes short replies that indicate agreement, acceptance, or recognition, such as: 'ok,' 'got it,' 'noted,' 'understood,' 'done,' or similar phrases. "
-                    "Also return 'true' if the acknowledgment includes polite closings like 'ok, bye' or 'ok, have a great day.' "
-                    "Return 'false' if the response contains an Acknowledgment/Confirmation **followed by a further question or request for explanation**, such as 'ok, explain' or 'ok, what is bike insurance.' "
-                    "Return 'false' if the response contains an Acknowledgment/Confirmation **followed by a statement requesting more details or information, even without question words**, such as 'great, principles of hotel management' or 'got it, insurance policies for bike.' "
-                    "Only respond with 'true' or 'false.'"
-                ),
-            },
-            {
-                "role": "user",
-                "content": user_input,
-            },
-        ]
-        gpt_res = await ResponseCreator().gpt_response_without_stream(prompt)
-        return gpt_res.strip().lower() == "true"
 
-    async def check_appreciation_message_auto_reply(self, user_input: str) -> bool:
-        """Check if message is an appreciation using GPT"""
-        prompt = [
-            {
-                "role": "system",
-                "content": (
-                    "You are an assistant that determines whether a user's input is an Appreciation Response. "
-                    "An Appreciation Response includes short messages that express gratitude or satisfaction, such as: 'thank you,' 'appreciated,' 'perfect,' 'that's it,' 'great,' 'excellent,' or similar phrases. "
-                    "Also return 'true' if the appreciation includes polite closings like 'thank you, have a nice day.' "
-                    "Return 'false' if the response contains an appreciation **followed by a further question or request for information**, such as 'thank you, what is insurance?' or 'appreciated, now tell me about banking.' "
-                    "Return 'false' if the response contains an appreciation **followed by a statement requesting more details or information, even without question words**, such as 'thank you, role of hotel management' or 'great, insurance policies for bike.' "
-                    "Only respond with 'true' or 'false.'"
-                ),
-            },
-            {
-                "role": "user",
-                "content": user_input,
-            },
-        ]
-        gpt_res = await ResponseCreator().gpt_response_without_stream(prompt)
-        return gpt_res.strip().lower() == "true"
+        try:
+            raw = await ResponseCreator().gpt_response_without_stream(prompt)
+            print("raw>>>>>>>>>>>>>>>>>>>>>>>>>>>>>",raw)
+        except Exception as e:
+            # LLM call failed — conservatively continue to RAG
+            print("[get_goforward_decision_and_response] LLM call failed:", e)
+            return {
+                "goforward": True,
+                "response": None,
+                "detected_language": "unknown",
+                "language_code": "",
+                "translated_input": ""
+            }
+        return raw
 
-    async def check_normal_chat_message_auto_reply(self, user_input: str) -> bool:
-        """Check if message is a normal chat using GPT"""
-        prompt = [
-            {
-                "role": "system",
-                "content": (
-                    "You are an assistant that determines whether a user's input is a normal chat message. "
-                     "like-  hello, how are you, what is your name, what are you doing, etc. "
-                    "Return 'true' if the input is a normal chat message, otherwise return 'false'."
-                ),
-            },
-            {
-                "role": "user",
-                "content": user_input,
-            },
-        ]
-        gpt_res = await ResponseCreator().gpt_response_without_stream(prompt)
-        print(f"GPT_RES normal chat ---------- {gpt_res}\n")
-        return gpt_res.strip().lower() == "true"
 
-    def create_greetings_response(self) -> str:
-        """Create greeting response"""
-        greetings_responses = [
-            "Hello! How can I help you today?",
-            "Hi there! What would you like to know?",
-            "Good day! How may I assist you?",
-        ]
-        import random
-        return random.choice(greetings_responses)
 
-    def create_thanking_response(self) -> str:
-        """Create thanking response"""
-        thanks_responses = [
-            "You're welcome! I'm here to help.",
-            "My pleasure! Feel free to ask if you need anything else.",
-            "Happy to help! Is there anything else you'd like to know?",
-        ]
-        import random
-        return random.choice(thanks_responses)
 
-    def create_confirmation_response(self) -> str:
-        """Create confirmation response"""
-        return "Got it! Is there anything else you'd like to know?"
+
 
     # Advanced RAG functionality from bot system
     async def get_multi_response_from_gpt_based_on_user_input(
-        self, user_input: str
+        self, user_input: str, chat_history_text: str
     ) -> str:
-        """Extract language from user input using GPT"""
+        """Extract language, translate, and detect follow-up from user input using GPT"""
      
 
         prompt = [
             {
                 "role": "system",
-                "content": (
-                    "You are an advanced AI designed to extract the most precise keywords, synonyms, and related terms from a user query, "
-                    "ensuring high relevance and contextual accuracy for search optimization. Your goal is to maximize search precision "
-                    "by focusing on intent-based keyword extraction.\n\n"
+                "content": f"""You are an AI assistant whose job is to DETECT THE LANGUAGE of a user's message and to PRODUCE
+a single, standardized ENGLISH query that combines the current user input with the last two
+chat messages (the previous user message and the assistant reply).
 
-                    "### **Instructions:**\n"
-                    "🔹 **Detect the language and translate to English if necessary.**\n"
-                   
-                    "🔹 **Return 'follow_up': true if the query is a follow-up question, otherwise return 'follow_up': false**.\n\n"
+REQUIREMENTS:
+1) Input sources you must use: the provided user_input string and the provided chat_history
+   (which contains the last two messages: previous user message and previous assistant message).
+   Use those to resolve references (like 'uske', 'it', 'that') when possible and create a single
+   clear, self-contained English query that captures the user's intent.
+2) Detect the language of the user_input. Supported languages: English, Hindi, Hinglish, Marathi, Gujarati.
+   Provide the language name in detected_language and the ISO 639-1 code in language_code.
+3) Translate and rewrite: produce translated_input — one concise, natural-sounding English sentence or
+   short paragraph that represents the user's intended request after incorporating relevant context
+   from the last two chat messages. Expand vague references using the chat history.
 
-                    "### **Output Format (JSON):**\n"
-                    "{\n"
-                    '  "detected_language": "<detected language>",\n'
-                    '  "translated_input": "<translated English text>",\n'
-                    '  "language_code": "<ISO 639-1 language code>",\n'
-                    '  "follow_up": <true/false>\n'
-                    "}\n\n"
+OUTPUT RULES (MUST BE FOLLOWED EXACTLY):
+- Return ONLY valid JSON (no surrounding text, no markdown) with exactly these three keys:
+{{
+  "detected_language": "<language name>",
+  "translated_input": "<combined, standardized English query>",
+  "language_code": "<ISO 639-1 code>"
+}}
 
-                    f"User input: {user_input}"
-                )
+    ADDITIONAL GUIDELINES:
+    - Keep translated_input complete and actionable.if user_input is independent then keep it as it is else use chat history if needed, else only user input.
+      EXAMPLE: 
+         in chat history: user_input -  "what is the frequency and sound of the radio wave".
+                          assistant_reply -  "The frequency of a radio wave is the number of oscillations per second, and the sound of a radio wave is the pitch of the sound it makes when it is received by a radio receiver."
+         now is user_input -  "Find the following for given wave equation.
+ P = 0.02 sin [(3000 t – 9 x] (all quantities are in S.I. units.)
+ (a) Frequency (b) Wavelength (c) Speed of sound wave
+ (d) If the equilibrium pressure of air is in 105
+ Pa then find maximum and minimum pressure. ".
+        then translated_input should not combine user_input and chat history, it should be only user_input because user_input is independent.
+
+    - If user explicitly asks for the response in a particular language, set `detected_language` to that language.
+    - and include a note in `translated_input` specifying the required response language.
+    - Preserve intent and parameters from user input.
+
+Payload:
+USER_INPUT: {user_input}
+CHAT_HISTORY_LAST_TWO: {chat_history_text}
+"""
             }
-        ]
+       ]
+
+
 
         return await ResponseCreator().gpt_response_without_stream(prompt)
 
-    async def process_bot_response(self, db, user_message, language_code):
+    def _get_cache_key(self, query: str, document_id: str = None) -> str:
+        """Generate cache key for query"""
+        cache_string = f"{query.lower().strip()}_{document_id or 'default'}"
+        return hashlib.md5(cache_string.encode()).hexdigest()
+
+    def _get_from_cache(self, cache_key: str):
+        """Get result from cache"""
+        if cache_key in self._query_cache:
+            print(f"🎯 Cache HIT for query")
+            return self._query_cache[cache_key]
+        return None
+
+    def _set_cache(self, cache_key: str, result):
+        """Set result in cache with size limit"""
+        if len(self._query_cache) >= self._cache_max_size:
+            # Remove oldest entry (simple FIFO)
+            oldest_key = next(iter(self._query_cache))
+            del self._query_cache[oldest_key]
+        
+        self._query_cache[cache_key] = result
+        print(f"💾 Cached query result")
+
+    async def process_bot_response(self, db, user_message, language_code, detected_language, web_search_task=None, use_web_search=False):
         """
         Processes the bot response by searching answers, translating if needed, and generating GPT response.
         """
         try:
+            print("user_message>>>>>>>>>>>>>>>>>>>>>>>>>>>>>",user_message)
             bot_graph_mixin = BotGraphMixin(db=db)
-            answer_ids = await bot_graph_mixin.search_answers(
+            # Optimized semantic search with caching and timing
+            cache_key = self._get_cache_key(user_message, self.document_id)
+            cached_result = self._get_from_cache(cache_key)
+            
+            if cached_result:
+                answer_ids = cached_result
+                print(f"🎯 Using cached search results: {len(answer_ids)} IDs")
+            else:
+                print("🔍 Starting semantic search...")
+                search_start = asyncio.get_event_loop().time()
+                answer_ids = await bot_graph_mixin.search_answers(
                 [user_message.lower()], chunk_msmarcos_collection, self.document_id
             )
+                search_end = asyncio.get_event_loop().time()
+                print(f"⚡ Search completed in {search_end - search_start:.3f}s")
+                self._set_cache(cache_key, answer_ids)
+            
             print(f"SEARCH_ANSWERS IDs: {answer_ids}\n")
             print("self.document_id-------------------doc--------", self.document_id)
 
@@ -340,13 +495,13 @@ class MongoDBBotHandler:
                             "$project": {
                                 "chunk": 1,
                                 "doc_type": "$document.type",
-                                "doc_id": "$document._id"
+                                "doc_id": "$document._id",
+                                "doc_summary": "$document.summary"
                             }
                         }
                     ]
 
                     chunk_results = list(db["chunks"].aggregate(pipeline))
-                    print(f"CHUNK_RESULTS: {chunk_results}\n")
 
                     if not chunk_results:
                         print("No relevant chunks found.\n")
@@ -354,9 +509,8 @@ class MongoDBBotHandler:
                  
                     formatted_results = [
                         {
-                            "context_data": result["chunk"], 
-                            "document_type": result["doc_type"], 
-                            "summary": "Default summary",
+                            "context_data": result["chunk"],
+                            "summary": result.get("doc_summary", "No summary available"),
                             "document_id": str(result["doc_id"])
                         }
                         for result in chunk_results
@@ -364,76 +518,175 @@ class MongoDBBotHandler:
                 except Exception as e:
                     print(f"ERROR_IN_CHUNK_QUERY: {str(e)}\n")
                     return False
-                print("formatted_results>>>>>>>>>>>>>>>>>>>>>>>>>>>>>", formatted_results)
+                # print("formatted_results>>>>>>>>>>>>>>>>>>>>>>>>>>>>>", formatted_results)
                 
-                # Get GPT response from chunks
-                gpt_resp = await self.get_chunk_response_from_gpt(user_message, formatted_results)
-
-                response_data = self.extract_json_from_text(gpt_resp)
-                print("response_data>>>>>>>>>>>>>>>>>>>>>>>>>>>>>",response_data)
-                answer = response_data.get("answer")
-                document_type = response_data.get("document_type")
-                gpt_flag = response_data.get("GPT_FLAG")
-                print(f"GPT_FLAG >>> {gpt_flag}\n")
-                print(f"ANSWER >>> {answer}\n")
-
-                if answer:
-                    translator = Translator(to_lang=language_code)
-                    translated_chunk_answer = translator.translate(answer)
-                    print("inside the if condition>>>>>>>>>>>>>>>>>>>>>>>>>>>>>")
-                    
-                    # Streaming response generator
-                    async def string_to_generator(data):
-                        for char in data:
-                            yield char
-                            await asyncio.sleep(0.01)
-
-                    generator = string_to_generator(translated_chunk_answer)
-                    print(f"GENERATOR >>> {generator}\n")
-
-                    # Send response to frontend
-                    await self.websocket_response.create_streaming_response(
-                        generator,
-                        f"rag_response_{datetime.now().timestamp()}",
-                        document_type,
-                        True
+                # Get web search results if task is provided
+                web_results = []
+                if web_search_task:
+                    try:
+                        web_results = await web_search_task
+                        print(f"✅ Web search completed with {len(web_results)} results")
+                    except Exception as e:
+                        print(f"❌ Web search failed: {e}")
+                        web_results = []
+                
+                # Rule 1: If user enabled web search, always use "web_search" citation
+                # For other cases, we'll determine citation AFTER GPT response (based on actual usage)
+                initial_citation_source = None
+                if use_web_search:
+                    initial_citation_source = "web_search"
+                    print(f"📚 Citation source: {initial_citation_source} (user enabled web search)")
+                
+                # Get GPT response from chunks with web results (optimized)
+                print("🤖 Starting GPT response generation...")
+                gpt_start = asyncio.get_event_loop().time()
+                
+                # Get the generator (don't await it!)
+                gpt_resp_generator = self.get_chunk_response_from_gpt(
+                    user_message, 
+                    formatted_results, 
+                    detected_language, 
+                    web_results
+                )
+                
+                print("📡 Sending streaming response to frontend...")
+                # Create a wrapper generator that will determine citation after response
+                response_text_container = {"text": ""}
+                message_id = f"rag_response_{datetime.now().timestamp()}"
+                
+                async def wrapped_generator():
+                    async for chunk in gpt_resp_generator:
+                        response_text_container["text"] += chunk
+                        yield chunk
+                
+                # Send response to frontend - pass the wrapped generator
+                # This returns the complete text after streaming
+                final_response = await self.websocket_response.create_streaming_response(
+                    wrapped_generator(),
+                    message_id,
+                    True,
+                    citation_source=None  # Will be determined after response
+                )
+                
+                # ✅ Determine actual citation source based on GPT response analysis
+                # Check if GPT actually used chunks or relied on its own knowledge (70-80% threshold)
+                actual_response = response_text_container["text"] or final_response
+                if initial_citation_source:
+                    citation_source = initial_citation_source  # Web search already set
+                else:
+                    citation_source = self._determine_citation_from_response(
+                        actual_response,
+                        formatted_results,
+                        user_message,
+                        web_results
                     )
+                    print(f"📚 Final citation source determined: {citation_source}")
+                
+                # ✅ Send citation source update via WebSocket metadata
+                # Update the stop message with correct citation source
+                try:
+                    await self.websocket_response.connection_manager.send_personal_message(
+                        self.websocket_response.websocket,
+                        {
+                            "mt": "chat_message_bot_partial",
+                            "chatId": self.chat_id,
+                            "stop": message_id,
+                            "citation_source": citation_source,  # Add citation to stop message
+                            "timestamp": datetime.now().isoformat(),
+                        }
+                    )
+                    print(f"📡 Citation source update sent: {citation_source}")
+                except Exception as e:
+                    print(f"⚠️ Failed to send citation update: {e}")
+                
+                gpt_end = asyncio.get_event_loop().time()
+                print(f"✅ GPT streaming completed in {gpt_end - gpt_start:.3f}s")
+                
+                # Save bot message to database after streaming completes
+                try:
+                    bot_message_data = ChatMessageCreate(
+                        chat_id=self.chat_id,
+                        message=final_response,
+                        is_bot=True,
+                        type="text"
+                    )
+                    bot_message_id = await self.chat_repository.create_chat_message(bot_message_data)
+                    print(f"💾 Bot message saved to DB: {bot_message_id}")
+                except Exception as save_error:
+                    print(f"⚠️ Error saving bot message to DB: {save_error}")
+                    # Don't fail the request if DB save fails
 
-                    return True
+                return True
+
+            # Get web search results for fallback case too
+            web_results = []
+            if web_search_task:
+                try:
+                    web_results = await web_search_task
+                    print(f"✅ Web search completed for fallback with {len(web_results)} results")
+                except Exception as e:
+                    print(f"❌ Web search failed in fallback: {e}")
+                    web_results = []
+
+            # ✅ Determine citation source for fallback
+            # If user enabled web search, always use "web_search"
+            if use_web_search:
+                citation_source = "web_search"
+            elif web_results and len(web_results) > 0:
+                citation_source = "web_search"  # Web search available but no documents
+            else:
+                citation_source = "ai"  # Pure AI response
+            print(f"📚 Fallback citation source: {citation_source}")
 
             # Fallback to GPT response if no answer found
+            print("📝 No relevant chunks found, using fallback GPT response...")
             gpt_resp = await ResponseCreator().get_gpt_response(
                 user_message,
                 language_code,
                 self.chat_id,
             )
-            print("gpt_resp>>>>>>>>>>>>>>>>>>>>",gpt_resp)
             if not gpt_resp:
+                print("⚠️ Fallback GPT response also failed")
                 return False
-            print("gpt_resp>>>>>>>>after if condition>>>>>>>>>>>>",gpt_resp)
+                
             if hasattr(gpt_resp, "__aiter__"):
                 gpt_resp_text = "".join([chunk async for chunk in gpt_resp])
-                print("gpt_resp_text>>>>>>>>in if condition>>>>>>>>>>>>",gpt_resp_text)
             else:
                 gpt_resp_text = gpt_resp
-                print(f"Final GPT Response: {gpt_resp_text}\n")
+            
+            print(f"✅ Fallback GPT Response length: {len(gpt_resp_text)} chars")
 
-            # Streaming response generator
+            # Ultra-fast streaming response generator
             async def string_to_generator(data):
-                for char in data:
-                    yield char
-                    await asyncio.sleep(0.01)
+                chunk_size = 10  # Chunk size for streaming
+                delay = 0.01  # Small delay for smooth streaming
+                for i in range(0, len(data), chunk_size):
+                    chunk = data[i:i+chunk_size]
+                    yield chunk
+                    await asyncio.sleep(delay)
 
             generator = string_to_generator(gpt_resp_text)
-            print("generator>>>>>>>>final generator>>>>>>>>>>>>>",generator)
 
-            # Send response to frontend
-            await self.websocket_response.create_streaming_response(
+            # Send response to frontend and get final text
+            final_response = await self.websocket_response.create_streaming_response(
                 generator,
-                f"gpt_response_{datetime.now().timestamp()}",
-                'public',
-                True
+                f"gpt_fallback_{datetime.now().timestamp()}",
+                True,
+                citation_source=citation_source  # ✅ Pass citation source
             )
+            
+            # Save bot message to database after streaming completes
+            try:
+                bot_message_data = ChatMessageCreate(
+                    chat_id=self.chat_id,
+                    message=final_response,
+                    is_bot=True,
+                    type="text"
+                )
+                bot_message_id = await self.chat_repository.create_chat_message(bot_message_data)
+                print(f"💾 Fallback bot message saved to DB: {bot_message_id}")
+            except Exception as save_error:
+                print(f"⚠️ Error saving fallback bot message to DB: {save_error}")
 
             return True   
 
@@ -441,75 +694,85 @@ class MongoDBBotHandler:
             print(f"Error in process_bot_response: {e}\n")
             return False
 
-    async def get_chunk_response_from_gpt(self, user_query: str, chunk_info: list) -> str:
-        """Get GPT response based on chunk information"""
+    async def get_chunk_response_from_gpt(self, user_query: str, chunk_info: list, detected_language: str, web_results: list):
+        """
+        Get GPT response based on chunk information as an async generator.
+        Yields tokens as they arrive for real-time streaming.
+        """
         try:
+            # Validate user query
             if not isinstance(user_query, str) or not user_query.strip():
                 print("⚠️ Warning: Invalid user query. Proceeding with a fallback response.")
                 user_query = "Provide general information based on available data."
  
+            # Validate chunk info
             if not isinstance(chunk_info, list) or len(chunk_info) == 0:
                 print("⚠️ Warning: No context data provided. Proceeding with a fallback response.")
-                return json.dumps({
-                    "answer": "No relevant context was found, so here is a general response.",
-                    "document_type": None,
-                    "GPT_FLAG": "General Knowledge"
-                })
+                fallback_msg = "No relevant context was found. Let me provide a general response based on your question."
+                # Yield fallback message in chunks for streaming effect
+                for i in range(0, len(fallback_msg), 10):
+                    yield fallback_msg[i:i+10]
+                    await asyncio.sleep(0.01)
+                return
+            
+            print("🔍 Processing query:", user_query)    
  
             # Generate formatted context data and summary references
             formatted_chunks, summary_tracker = self.format_context_data(chunk_info)
-            print("formatted_chunks>>>>>>>>>>>>>>>>>>>>>>>>>.",formatted_chunks)
-            print("summary_tracker>>>>>>>>>>>>>>>>>>>>>>>>>.",summary_tracker)
  
             if not formatted_chunks:
                 print("⚠️ Warning: No valid context found. Proceeding with a fallback response.")
-                return json.dumps({
-                    "answer": "No relevant context was found, so here is a general response.",
-                    "document_type": None,
-                    "GPT_FLAG": "General Knowledge"
-                })
- 
+                fallback_msg = "No relevant context was found. Let me provide a general response based on your question."
+                for i in range(0, len(fallback_msg), 10):
+                    yield fallback_msg[i:i+10]
+                    await asyncio.sleep(0.01)
+                return
+                
             # Construct the prompt with document_id linking
+            # ✅ Add relevance check instruction for citation logic
+            relevance_instruction = ""
+            if not web_results:  # Only check relevance if web search is OFF
+                relevance_instruction = """
+                ### IMPORTANT RELEVANCE CHECK:
+                - First, carefully analyze if the Context Chunks are actually relevant to the User Query.
+                - If the chunks are NOT relevant (e.g., physics question asked but chemistry document chunks retrieved), 
+                  IGNORE the chunks and provide a general knowledge answer based on your training.
+                - Only use the Context Chunks if they are genuinely related to the user's query.
+                - If chunks are irrelevant, your response should indicate you're using general knowledge, not document content.
+                """
+            
             prompt_text = f"""
-            You are an intelligent AI assistant that answers user queries based on provided dynamic context data.
- 
-            ### User Query:
-            {user_query}
- 
-            ### Context Data:
-            {''.join(formatted_chunks)}
- 
-            ### Summaries (Reference by Document ID):
-            {json.dumps(summary_tracker, indent=2)}
- 
-            ### Instructions:
-            - Use the **summary from the reference section** for each `document_id` when generating answers.
-            - If a **summary exists**, prioritize it for accuracy.
-            - If no summary is available, rely only on **context_data**.
-            - If no relevant context is found, provide a **general knowledge-based response**.
-            - Respond in **JSON format**.
-            - Find the **best matching** context chunk using similarity scoring.
-            - Select **one document_type** based on the highest relevance.
-            - If a **summary exists**, use it for better accuracy in generating answers.
-            - If no summary is provided, rely only on **context_data** (do not generate a summary).
-            - If no relevant context is found, provide a **general knowledge** answer.
-            - Return the response in JSON format.
- 
-            ### JSON Response Format:
-            ```json
-            {{
-                "answer": "<Generated Answer>",
-                "document_type": "<Matched Document or null>",
-                "GPT_FLAG": "<null or 'General Knowledge'>"
-            }}
-            ```
-            """
+                You are an intelligent AI assistant that answers the user's query.
+
+                ### User Query:
+                {user_query}
+
+                ### Context Chunks:
+                {''.join(formatted_chunks)}
+
+                ### Summaries:
+                {json.dumps(summary_tracker, indent=2)}
+
+                ### Web Search Results:
+                {web_results[0].get('content', 'No additional web context available') if web_results else "No additional web context available"}
+
+                {relevance_instruction}
+
+                ### Instructions:
+                - Respond in the hinglish or english user's language: {detected_language}.
+                - Use summaries if available; otherwise rely on context chunks (ONLY if they are relevant to the query).
+                - If web search results are available, use them for additional context.
+                - Provide an answer combining your knowledge, context chunks (if relevant), and web results.
+                - If detailed answer is needed, provide a detailed response using all available sources.
+                - If no relevant info in chunks, provide a detailed general knowledge answer.
+                - Respond as a teacher would to a student.
+                """
  
             # Create proper message format for OpenAI API
             messages = [
                 {
                     "role": "system",
-                    "content": "You are a helpful assistant that responds in JSON format."
+                    "content": "You are a helpful assistant that responds as a teacher would to a student."
                 },
                 {
                     "role": "user",
@@ -517,36 +780,49 @@ class MongoDBBotHandler:
                 }
             ]
  
+            # Stream response from GPT
+            print("🤖 Starting GPT streaming...")
+            token_count = 0
+            
             try:
-                # Get response from GPT
-                gpt_res = await ResponseCreator().gpt_response_without_stream(messages)
+                async for token in ResponseCreator().get_streaming_response(messages):
+                    if token:
+                        token_count += 1
+                        if token_count % 50 == 0:  # Log every 50 tokens
+                            print(f"📝 Streamed {token_count} tokens...")
+                        yield token
+                
+                if token_count == 0:
+                    print("⚠️ Warning: Empty response from GPT API. Sending fallback.")
+                    fallback_msg = "I couldn't generate a proper response at the moment. Please try again."
+                    for i in range(0, len(fallback_msg), 10):
+                        yield fallback_msg[i:i+10]
+                        await asyncio.sleep(0.01)
+                else:
+                    print(f"✅ Streaming completed successfully with {token_count} tokens")
  
-                if not gpt_res:
-                    print("⚠️ Warning: Empty response from GPT API. Returning fallback.")
-                    return json.dumps({
-                        "answer": "I couldn't process your request at the moment.",
-                        "document_type": None,
-                        "GPT_FLAG": "General Knowledge"
-                    })
- 
-                print("✅ Raw GPT response:", gpt_res)
-                return gpt_res
- 
+            except asyncio.TimeoutError:
+                print("🚨 GPT API Timeout - Sending timeout message")
+                error_msg = "The response took too long. Please try again with a shorter query."
+                for i in range(0, len(error_msg), 10):
+                    yield error_msg[i:i+10]
+                    await asyncio.sleep(0.01)
+                    
             except Exception as api_error:
-                print(f"🚨 GPT API Error: {api_error} - Returning fallback response.")
-                return json.dumps({
-                    "answer": "I'm sorry, I couldn't process your request.",
-                    "document_type": None,
-                    "GPT_FLAG": "General Knowledge"
-                })
+                print(f"🚨 GPT API Error during streaming: {api_error}")
+                error_msg = "I encountered an error while generating the response. Please try again."
+                for i in range(0, len(error_msg), 10):
+                    yield error_msg[i:i+10]
+                    await asyncio.sleep(0.01)
  
         except Exception as e:
-            print(f"🚨 Unexpected error: {e} - Proceeding with fallback response.")
-            return json.dumps({
-                "answer": "An unexpected error occurred, but I am still able to assist with general knowledge.",
-                "document_type": None,
-                "GPT_FLAG": "General Knowledge"
-            })
+            print(f"🚨 Unexpected error in get_chunk_response_from_gpt: {e}")
+            import traceback
+            traceback.print_exc()
+            error_msg = "An unexpected error occurred. Please try again later."
+            for i in range(0, len(error_msg), 10):
+                yield error_msg[i:i+10]
+                await asyncio.sleep(0.01)
 
     def format_context_data(self, chunk_info):
         """Format context data for GPT processing"""
@@ -565,7 +841,6 @@ class MongoDBBotHandler:
                 document_type = ctx.get("document_type", "Unknown Document")
                 context_data = ctx.get("context_data", "No context available.")
                 summary = ctx.get("summary", "").strip()
- 
                 if not document_id:
                     print("⚠️ Warning: Missing 'document_id' in context. Skipping this chunk.")
                     continue  # Skip chunk but continue execution
@@ -584,6 +859,111 @@ class MongoDBBotHandler:
  
         return formatted_chunks, summary_tracker  # Return both chunks & summary references
 
+    def _determine_citation_from_response(
+        self,
+        gpt_response: str,
+        formatted_chunks: list,
+        user_query: str,
+        web_results: list
+    ) -> str:
+        """
+        Determine citation source by analyzing if GPT actually used chunks or relied on own knowledge.
+        Uses keyword matching and chunk content comparison to check if response is 70-80% from chunks.
+        
+        Args:
+            gpt_response: The GPT-generated response
+            formatted_chunks: List of document chunks that were provided
+            user_query: Original user query
+            web_results: Web search results (if any)
+            
+        Returns:
+            "document" if chunks were used (70%+ from chunks)
+            "web_search" if web results were used
+            "ai" if GPT used mostly its own knowledge
+        """
+        try:
+            # Rule 1: If no chunks provided, definitely AI
+            if not formatted_chunks or len(formatted_chunks) == 0:
+                return "ai"
+            
+            # Rule 2: Check if response contains indicators that chunks were ignored
+            response_lower = gpt_response.lower()
+            ignore_keywords = [
+                "not found in the document",
+                "not in the provided context",
+                "not mentioned in",
+                "general knowledge",
+                "based on my knowledge",
+                "the document doesn't contain",
+                "not available in the context",
+                "outside the scope",
+                "irrelevant"
+            ]
+            
+            for keyword in ignore_keywords:
+                if keyword in response_lower:
+                    print(f"📚 GPT indicated chunks were ignored (keyword: {keyword})")
+                    return "ai"
+            
+            # Rule 3: Check content similarity - extract key phrases from chunks
+            # Simple approach: Check if significant chunk content appears in response
+            chunk_content_used = False
+            chunk_phrases = []
+            
+            for chunk_info in formatted_chunks:
+                if isinstance(chunk_info, dict):
+                    chunk_text = chunk_info.get("context_data", "")
+                else:
+                    chunk_text = str(chunk_info)
+                
+                # Extract key phrases from chunk (simple: first 50-100 words)
+                words = chunk_text.split()[:50]
+                key_phrase = " ".join(words).lower()
+                chunk_phrases.append(key_phrase)
+                
+                # Check if this phrase appears in response
+                if len(key_phrase) > 20 and key_phrase in response_lower:
+                    chunk_content_used = True
+                    break
+            
+            # Rule 4: Check response length vs chunk content
+            # If response is very long but doesn't match chunks, likely AI-generated
+            response_length = len(gpt_response.split())
+            if response_length > 100 and not chunk_content_used:
+                # Check if response contains unique terms not in chunks
+                response_words = set(response_lower.split())
+                chunk_words = set()
+                for phrase in chunk_phrases:
+                    chunk_words.update(phrase.split())
+                
+                # If > 70% of response words are NOT in chunks, likely AI
+                unique_ratio = len(response_words - chunk_words) / len(response_words) if response_words else 0
+                if unique_ratio > 0.7:
+                    print(f"📚 Response has {unique_ratio*100:.1f}% unique content (not from chunks)")
+                    return "ai"
+            
+            # Rule 5: If chunks were provided and response seems to use them, return "document"
+            if chunk_content_used:
+                return "document"
+            
+            # Rule 6: Default to "document" if chunks provided, but with caution
+            # If response is very short or generic, likely AI
+            if response_length < 30:
+                print(f"📚 Response too short ({response_length} words), likely AI")
+                return "ai"
+            
+            # If we have chunks but couldn't verify usage, assume document (conservative)
+            # But log a warning
+            print(f"⚠️ Could not definitively determine citation source, defaulting to 'document'")
+            return "document"
+            
+        except Exception as e:
+            print(f"🚨 Error in citation determination: {e}")
+            # Fallback: if chunks provided, assume document
+            if formatted_chunks and len(formatted_chunks) > 0:
+                return "document"
+            return "ai"
+    
     def extract_json_from_text(self, text: str):
         """Extract complete JSON data from the given text."""
         # Find JSON content using regex
@@ -593,31 +973,53 @@ class MongoDBBotHandler:
         if match:
             json_text = match.group(0)
             try:
-                json_data = json.loads(json_text)  # Convert JSON string to Python object
+                json_data = json.loads(json_text)
                 return json_data
             except json.JSONDecodeError as e:
-                print("JSON Parsing Error:", e)
+                print(f"JSON Parsing Error: {e}")
+                try:
+                    # Extract fields using regex to avoid escape sequence issues
+                    answer_match = re.search(r'"answer"\s*:\s*"(.*?)"(?=\s*,\s*")', json_text, re.DOTALL)
+                    doc_type_match = re.search(r'"document_type"\s*:\s*(".*?"|null)', json_text)
+                    gpt_flag_match = re.search(r'"GPT_FLAG"\s*:\s*(".*?"|null)', json_text)
+                    if answer_match:
+                        answer = answer_match.group(1)
+                        doc_type = doc_type_match.group(1).strip('"') if doc_type_match and doc_type_match.group(1) != "null" else None
+                        gpt_flag = gpt_flag_match.group(1).strip('"') if gpt_flag_match and gpt_flag_match.group(1) != "null" else None
+                        
+                        return {
+                            "answer": answer,
+                            "document_type": doc_type,
+                            "GPT_FLAG": gpt_flag,
+                        }
+                except Exception as e2:
+                    print(f"Regex extraction failed: {e2}")
                 return None
         return None
 
     async def get_chat_history(self) -> str:
-        """Get chat history from MongoDB for follow-up questions"""
+        """Get last 2 chat messages from MongoDB for follow-up questions"""
         try:
-            # Get recent messages from MongoDB chat
-            messages = await self.chat_repository.get_chat_messages(self.chat_id, page=1, limit=2)
-            
+            print("inside get_chat_history>>>>>>>>>>>>>>>>>>>>>>>>>>>>>")
+            # Get last 2 messages using a special method
+            messages = await self.chat_repository.get_last_chat_messages(
+                self.chat_id, limit=2
+            )
+            print("messages>>>>>>>>>>history>>>>>>>>>>>>>>>.", messages)
+
             if messages:
                 chat_history = []
                 for msg in messages:
-                    sender = "User" if not msg.get("is_bot", False) else "AI"
-                    chat_history.append(f"{sender}: {msg.get('message', '')}")
-                
+                    sender = "User" if not msg.is_bot else "AI"
+                    chat_history.append(f"{sender}: {msg.message}")
+
                 return "\n".join(chat_history)
+
             return ""
-            
         except Exception as e:
             logger.error(f"Error getting chat history: {e}")
             return ""
+
 
     def is_greeting(self, message: str) -> bool:
         """Check if message is a greeting"""
@@ -785,23 +1187,27 @@ class MongoDBBotMessage:
             self.language_code
         )
 
-    async def send_bot_message(self, user_message: str) -> bool:
+    async def send_bot_message(self, user_message: str, use_web_search: bool = False) -> bool:
         """
         Send bot message in response to user message with full RAG functionality.
         Returns True if successful, False if no answer found.
+        
+        Args:
+            user_message: The user's message
+            use_web_search: Whether to enable web search (default: False)
         """
         try:
             # Show typing indicator
             await self.bot_handler.send_typing_indicator()
             
             # Handle the user message with advanced RAG processing
-            is_result_found = await self.bot_handler.handle_user_message(user_message)
-            
+            is_result_found = await self.bot_handler.handle_user_message(user_message, use_web_search=use_web_search)
+            print("is_result_found>>>>>>>>>vmvm,mxv,mx>>>>>>>>>>>>>>>>>>>>",is_result_found)
             # Stop typing indicator
             await self.bot_handler.stop_typing_indicator()
             
             # Return whether result was found
-            return not is_result_found  # Invert because True means no answer found in bot system
+            return is_result_found  # Invert because True means no answer found in bot system
             
         except Exception as e:
             logger.error(f"Error in send_bot_message: {e}")

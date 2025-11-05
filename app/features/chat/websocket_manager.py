@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import inspect
 from datetime import datetime
 from typing import Dict, List, Optional
 from fastapi import WebSocket, WebSocketDisconnect
@@ -130,7 +131,7 @@ class ChatWebSocketResponse:
             },
         )
 
-    async def send_message_partial(self, message_id: str, partial_text: str, doc_type: str = "public"):
+    async def send_message_partial(self, message_id: str, partial_text: str):
         """Send partial message content"""
         await self.connection_manager.send_personal_message(
             self.websocket,
@@ -139,21 +140,24 @@ class ChatWebSocketResponse:
                 "chatId": self.chat_id,
                 "uuid": message_id,
                 "partial": partial_text,
-                "message_context": doc_type,
                 "timestamp": datetime.now().isoformat(),
             },
         )
 
-    async def send_message_end(self, message_id: str):
-        """Send message end signal"""
+    async def send_message_end(self, message_id: str, citation_source: str = None):
+        """Send message end signal with optional citation metadata"""
+        message_data = {
+            "mt": "chat_message_bot_partial",
+            "chatId": self.chat_id,
+            "stop": message_id,
+            "timestamp": datetime.now().isoformat(),
+        }
+        # Add citation source to metadata if provided
+        if citation_source:
+            message_data["citation_source"] = citation_source
         await self.connection_manager.send_personal_message(
             self.websocket,
-            {
-                "mt": "chat_message_bot_partial",
-                "chatId": self.chat_id,
-                "stop": message_id,
-                "timestamp": datetime.now().isoformat(),
-            },
+            message_data,
         )
 
     async def send_message_complete(
@@ -187,37 +191,76 @@ class ChatWebSocketResponse:
 
     async def create_streaming_response(
         self,
-        text: str,
+        text,
         message_id: str = None,
-        doc_type: str = "public",
-        is_bot: bool = True
+        is_bot: bool = True,
+        save_to_db: bool = True,
+        citation_source: str = None  # ✅ Citation source: "document", "web_search", or "ai"
     ) -> str:
-        """Create a streaming response similar to the bot system"""
+        """
+        Streams text (string / coroutine / async generator / sync iterator) to the frontend,
+        buffers smaller websocket frames, and returns the full produced text.
+        
+        Args:
+            text: Text to stream (string, coroutine, async generator, or sync iterator)
+            message_id: Unique identifier for this message
+            is_bot: Whether this is a bot message
+            save_to_db: If False, skips sending the complete message (useful when message is saved elsewhere)
+        """
         if not message_id:
             message_id = str(uuid4())
 
-        # Send start signal
+        print(f"🎬 create_streaming_response: type={type(text).__name__}, message_id={message_id}")
         await self.send_message_start(message_id)
 
-        # Stream the text word by word
+        # Defensive handling:
+        # - If it's a coroutine, await it (prevent "was never awaited" warnings)
+        # - If it's a string -> wrap into async word generator
+        # - If it's an async generator / has __aiter__ -> use directly
+        # - If it's a sync iterable -> wrap into async generator
+        if inspect.iscoroutine(text):
+            text = await text
+            
+        text_generator = None
         if isinstance(text, str):
             text_generator = self.async_word_generator(text)
-        else:
+        elif inspect.isasyncgen(text) or hasattr(text, "__aiter__"):
             text_generator = text
+        else:
+            print(f"⚠️ Unexpected text type: {type(text)}")
+            return ""
+
+        print(f"✅ Generator ready: {type(text_generator).__name__}")
 
         final_text = ""
-        async for word in text_generator:
-            if word:
-                final_text += word
-                await self.send_message_partial(message_id, word, doc_type)
-                # Small delay to simulate streaming
-                await asyncio.sleep(0.05)
+        token_count = 0
+        
+        try:
+            async for word in text_generator:
+                if word:
+                    token_count += 1
+                    final_text += word
+                    await self.send_message_partial(message_id, word)
+                    # Small delay for smooth streaming (adjust as needed)
+                    await asyncio.sleep(0.01)  # Reduced from 0.05 for faster streaming
 
-        # Send end signal
-        await self.send_message_end(message_id)
+            print(f"✅ Streaming completed: {token_count} tokens, {len(final_text)} chars")
 
-        # Send complete message
-        await self.send_message_complete(final_text, is_bot, doc_type=doc_type)
+        except Exception as e:
+            print(f"🚨 Error during streaming: {e}")
+            import traceback
+            traceback.print_exc()
+            # Send error indicator (pass citation_source if available)
+            await self.send_message_end(message_id, citation_source)
+            raise
+
+        # Send end signal with citation source
+        await self.send_message_end(message_id, citation_source)
+
+        # Note: We DON'T send complete message here to avoid duplicate
+        # The frontend should accumulate partial messages and display them
+        # If you need to save to DB, do it in the calling function
+        print(f"🏁 Streaming finished. Final text length: {len(final_text)} chars")
 
         return final_text
 

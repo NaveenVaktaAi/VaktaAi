@@ -110,6 +110,7 @@ celerybeat.pid
 .volumes
 env/
 venv/
+static/
 volumes/
 ENV/
 env.bak/

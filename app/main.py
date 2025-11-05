@@ -1,5 +1,6 @@
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, APIRouter
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 from contextlib import asynccontextmanager
 from typing import List, Dict
 import json
@@ -7,40 +8,87 @@ import asyncio
 from datetime import datetime
 import nltk
 import uvicorn
+from app.avatar_config import ai_settings
+from app.features.aiAvatar.aiTutorServices.wsHandler import handle_student_ws
 from app.schemas.milvus.client import connect_to_milvus, disconnect_from_milvus
 from app.features.docSathi.router import router as docSathi_router
 from app.features.chat.router import router as chat_router
+from app.features.auth.router import router as auth_router
 from app.ai_service import ai_service
 from app.parent_agent import parent_agent
+from app.features.aiAvatar.router import router as aiAvatar_router
 routes = APIRouter()
 
+# run it when you want to connect to milvus
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # await get_manifests(["chatbot"])
-    connect_to_milvus()
-    print("Connected to Milvus")
+    try:
+        connect_to_milvus()
+        print("Connected to Milvus")
+    except Exception as e:
+        print(f"Warning: Could not connect to Milvus: {e}")
+        print("Server will start without Milvus connection")
+    
+    # Define tasks to close before yielding
+    tasks_to_close: List[asyncio.Future] = []
+    
     yield  # Start request handling
 
-    tasks_to_close: List[asyncio.Future] = [disconnect_from_milvus()]
+    # Cleanup tasks
+    try:
+        tasks_to_close.append(disconnect_from_milvus())
+        await asyncio.gather(*tasks_to_close, return_exceptions=True)
+    except Exception as e:
+        print(f"Error during cleanup: {e}")
 
-    await asyncio.gather(*tasks_to_close, return_exceptions=True)
 
 
 
 
 
+app = FastAPI(title="AI Chatbot API", version="1.0.0")
 
-app = FastAPI(title="AI Chatbot API", version="1.0.0",  lifespan=lifespan,)
+# app = FastAPI(title="AI Chatbot API", version="1.0.0",  lifespan=lifespan,)
 
-# CORS middleware to allow frontend connections
+# CORS middleware to allow frontend connections (MUST be before static files)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000"],  # Next.js dev server
+    allow_origins=["http://localhost:3000", "http://localhost:3001" ,"http://localhost:3002"],  # Frontend dev servers
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Mount static files for audio (AFTER CORS middleware)
+# Ensure static files directory exists
+import os
+static_dir = "static"
+if not os.path.exists(static_dir):
+    os.makedirs(static_dir, exist_ok=True)
+
+app.mount("/static", StaticFiles(directory="static"), name="static")
+
+# Add CORS headers for static files explicitly
+@app.middleware("http")
+async def add_cors_headers(request, call_next):
+    response = await call_next(request)
+    if request.url.path.startswith("/static/"):
+        response.headers["Access-Control-Allow-Origin"] = "*"
+        response.headers["Access-Control-Allow-Methods"] = "GET, OPTIONS"
+        response.headers["Access-Control-Allow-Headers"] = "*"
+        response.headers["Content-Type"] = "audio/mpeg" if request.url.path.endswith(".mp3") else response.headers.get("Content-Type", "application/octet-stream")
+    return response
+
+@app.get("/health")
+async def health():
+    return {"status": "healthy", "model": ai_settings.GROQ_MODEL}
+
+
+@app.websocket("/tutor")
+async def tutor_ws(ws: WebSocket):
+    await handle_student_ws(ws)
 
 
 
@@ -59,12 +107,12 @@ except LookupError:
 
 print("docSathi_router>>>>>>>>>>>>>>>>>>>>>>>>>>>>",docSathi_router)
 print("chat_router>>>>>>>>>>>>>>>>>>>>>>>>>>>>",chat_router)
-routes.include_router(router=docSathi_router)
-routes.include_router(router=chat_router)
-# app.include_router(processing_router)
-# app.include_router(vector_router)
-# app.include_router(rag_router)
-app.include_router(routes, prefix="/api/v1")
+
+# Include all routers directly in the app with proper prefixes
+app.include_router(docSathi_router, prefix="/api/v1")
+app.include_router(chat_router, prefix="/api/v1")
+app.include_router(auth_router, prefix="/api/v1", tags=["Authentication"])
+app.include_router(aiAvatar_router, prefix="/api/v1")
 class ConnectionManager:
     def __init__(self):
         self.active_connections: Dict[str, WebSocket] = {}

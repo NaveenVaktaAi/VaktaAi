@@ -44,7 +44,7 @@ class ChatMessageCreate(BaseModel):
     message: str = Field(..., description="The message content")
     is_bot: bool = Field(default=False, description="Whether this message is from bot or user")
     reaction: Optional[str] = Field(None, description="Reaction to the message")
-    token: Optional[int] = Field(None, description="Token count for the message")
+    token: Optional[str] = Field(None, description="Token for the message")
     type: Optional[str] = Field(default="text", description="Type of message (text, image, etc.)")
     is_edited: bool = Field(default=False, description="Whether the message has been edited")
     training_doc_id: Optional[str] = Field(None, description="ID of the training document this message is related to")
@@ -63,13 +63,13 @@ class ChatMessageResponse(BaseModel):
     id: str = Field(..., alias="_id")
     chat_id: str
     message: str
-    is_bot: bool
+    is_bot: Optional[bool] = False
     reaction: Optional[str]
-    token: Optional[int]
-    type: str
-    is_edited: bool
-    created_ts: datetime
-    updated_ts: datetime
+    token: Optional[str]
+    type: Optional[str]
+    is_edited: Optional[bool] = False
+    created_ts: Optional[datetime]
+    updated_ts: Optional[datetime]
 
     class Config:
         allow_population_by_field_name = True

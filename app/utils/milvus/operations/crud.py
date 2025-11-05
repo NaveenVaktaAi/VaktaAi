@@ -4,7 +4,7 @@ from requests import Session
 from sqlalchemy import update
 
 from app.schemas.milvus.collection.milvus_collections import chunk_msmarcos_collection
-from app.utils.transformers.models import msmarco_model
+from app.utils.transformers.models import msmarco_model,multi_qa_mpnet_model
 from pymilvus import Collection
 from pymilvus import SearchResult
 from pymilvus import MilvusException, SearchResult
@@ -29,9 +29,9 @@ async def insert_chunk_to_milvus(
             return
             
         chunk = chunk.lower().replace("\n", " ")
-        msmarco_embeddings = msmarco_model.encode([chunk], normalize_embeddings=True)
+        msmarco_embeddings = multi_qa_mpnet_model.encode([chunk], normalize_embeddings=True)
         
-       
+        print("msmarco_embeddings>>>>>>>>>>>>>>>>>>>>>>>>>>>>",len(msmarco_embeddings[0]))
         chunk_msmarcos_collection.insert(
             [
                 [mongo_chunk_id],  # mongo_chunk_id field

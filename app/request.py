@@ -8,8 +8,18 @@ import fastapi
 import orjson
 from fastapi import routing as fastapi_routing
 from fastapi.datastructures import Default, DefaultPlaceholder
-from multipart.exceptions import MultipartParseError
-from sentry_sdk import capture_exception
+try:
+    from multipart.exceptions import MultipartParseError
+except ImportError:
+    # Fallback for when python-multipart is not installed
+    class MultipartParseError(Exception):
+        pass
+try:
+    from sentry_sdk import capture_exception
+except ImportError:
+    # Fallback for when sentry-sdk is not installed
+    def capture_exception(exception):
+        print(f"Exception captured: {exception}")
 from starlette.background import BackgroundTask
 from starlette.datastructures import FormData
 from starlette.requests import Request as StarletteRequest
@@ -158,25 +168,27 @@ class Request(StarletteRequest):
             return self.client.host
 
 
-def request_response(func: Callable) -> ASGIApp:
-    """
-    Takes a function or coroutine `func(request) -> response`,
-    and returns an ASGI application.
-    """
-    # from starlette._utils import is_async_callable
-    # from starlette.concurrency import run_in_threadpool
-    # is_coroutine = is_async_callable(func)
-
-    async def app(scope: Scope, receive: Receive, send: Send) -> None:
-        request = Request(scope, receive=receive, send=send)
-        # Force all views to be a coroutine
-        response = await func(request)
-        await response(scope, receive, send)
-
-    return app
-
-
-fastapi_routing.request_response = request_response
+# Removed custom request_response override to fix AsyncExitStack issues
+# The custom implementation was breaking FastAPI's dependency injection system
+# def request_response(func: Callable) -> ASGIApp:
+#     """
+#     Takes a function or coroutine `func(request) -> response`,
+#     and returns an ASGI application.
+#     """
+#     # from starlette._utils import is_async_callable
+#     # from starlette.concurrency import run_in_threadpool
+#     # is_coroutine = is_async_callable(func)
+#
+#     async def app(scope: Scope, receive: Receive, send: Send) -> None:
+#         request = Request(scope, receive=receive, send=send)
+#         # Force all views to be a coroutine
+#         response = await func(request)
+#         await response(scope, receive, send)
+#
+#     return app
+#
+#
+# fastapi_routing.request_response = request_response
 
 
 class ORJSONResponse(JSONResponse):
@@ -264,43 +276,46 @@ class WebSocket(StarletteWebSocket):
                 capture_exception(e)
 
 
-def websocket_session(func: Callable) -> ASGIApp:
-    """
-    Takes a coroutine `func(session)`, and returns an ASGI application.
-    """
-    # assert asyncio.iscoroutinefunction(func), "WebSocket endpoints must be async"
+# Removed custom websocket_session override to fix AsyncExitStack issues for WebSocket connections
+# The custom implementation was breaking FastAPI's dependency injection system for WebSockets
+# def websocket_session(func: Callable) -> ASGIApp:
+#     """
+#     Takes a coroutine `func(session)`, and returns an ASGI application.
+#     """
+#     # assert asyncio.iscoroutinefunction(func), "WebSocket endpoints must be async"
+#
+#     async def app(scope: Scope, receive: Receive, send: Send) -> None:
+#         session = WebSocket(scope, receive=receive, send=send)
+#         await func(session)
+#
+#     return app
+#
+#
+# fastapi_routing.websocket_session = websocket_session
 
-    async def app(scope: Scope, receive: Receive, send: Send) -> None:
-        session = WebSocket(scope, receive=receive, send=send)
-        await func(session)
-
-    return app
-
-
-fastapi_routing.websocket_session = websocket_session
-
-old_background_task_constructor = fastapi.BackgroundTasks.__init__
-
-
-def background_task_constructor(self, *args, **kwargs):
-    old_background_task_constructor(self, *args, **kwargs)
-    self.at_once = True
-
-
-async def background_task_call(self) -> None:
-    if self.at_once:
-        await asyncio.gather(*(task() for task in self.tasks), return_exceptions=True)
-    else:
-        for task in self.tasks:
-            await task()
-
-
-def add_task(self, func, *args, **kwargs) -> None:
-    task = BackgroundTask(func, *args, **kwargs)
-    task.is_async = True
-    self.tasks.append(task)
-
-
-fastapi.BackgroundTasks.add_task = add_task
-fastapi.BackgroundTasks.__init__ = background_task_constructor
-fastapi.BackgroundTasks.__call__ = background_task_call
+# Removed custom background task overrides to avoid potential conflicts with FastAPI's dependency injection
+# old_background_task_constructor = fastapi.BackgroundTasks.__init__
+#
+#
+# def background_task_constructor(self, *args, **kwargs):
+#     old_background_task_constructor(self, *args, **kwargs)
+#     self.at_once = True
+#
+#
+# async def background_task_call(self) -> None:
+#     if self.at_once:
+#         await asyncio.gather(*(task() for task in self.tasks), return_exceptions=True)
+#     else:
+#         for task in self.tasks:
+#             await task()
+#
+#
+# def add_task(self, func, *args, **kwargs) -> None:
+#     task = BackgroundTask(func, *args, **kwargs)
+#     task.is_async = True
+#     self.tasks.append(task)
+#
+#
+# fastapi.BackgroundTasks.add_task = add_task
+# fastapi.BackgroundTasks.__init__ = background_task_constructor
+# fastapi.BackgroundTasks.__call__ = background_task_call

@@ -12,8 +12,8 @@ class AIService:
             model=settings.MODEL_NAME,
             temperature=settings.TEMPERATURE,
             max_tokens=settings.MAX_TOKENS,
-            openai_api_key=settings.OPENAI_API_KEY
-        )
+            openai_api_key="fdsfdsfdsfdsf"
+            )
         
         # Memory to maintain conversation context
         self.memory = ConversationBufferMemory(return_messages=True)

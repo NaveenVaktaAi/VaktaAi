@@ -1,3 +1,4 @@
+from app.utils.openai.openai import start_openai
 from app.utils.youtube_transcript import get_transcript_with_cache
 from app.youtubeService.document_processor import DocumentProcessor
 from app.aws.secretKey import session
@@ -17,7 +18,7 @@ from urllib.parse import urljoin, urlparse
 from jinja2 import Environment, FileSystemLoader
 from app.aws.secretKey import get_secret_keys
 from sentry_sdk import capture_exception
-from app.features.docSathi.schema import UploadDocuments
+from app.features.docSathi.schema import DocumentChat, DocumentChatsResponse, DocumentTextResponse, UploadDocuments, DocumentSummary, DocumentSummaryResponse, DocumentNotes, DocumentNotesResponse, DocumentQuiz, DocumentQuizResponse, QuizQuestion, GenerateQuizRequest, StudentQuiz, QuestionAnswer, GenerateQuizResponse, QuizQuestionResponse, QuizResponse, GetDocumentQuizzesResponse, SubmitQuizRequest, QuizSubmissionResult, SubmitQuizResponse
 # from app.config import env_variables
 import nltk
 import numpy as np
@@ -26,10 +27,12 @@ from transformers import LEDForConditionalGeneration, LEDTokenizer
 import torch
 from nltk.tokenize import sent_tokenize
 from urllib.parse import urlparse, parse_qs
+from bson import ObjectId
+# import openai
+from datetime import datetime
 # env_vars = env_variables()
 
 from bson import ObjectId
-from app.database import get_db
 from datetime import datetime
 
 from fastapi import  HTTPException
@@ -236,17 +239,10 @@ async def get_documents_by_user_id(userId: str):
         for doc in documents:
             doc["_id"] = str(doc["_id"])
 
-        if documents:
-            return {
-                "data": documents,
-                "success": True,
-                "message": "Documents retrieved successfully.",
-            }
-
         return {
-            "data": [],
-            "success": False,
-            "message": "No documents found.",
+            "data": documents,
+            "success": True,
+            "message": "Documents retrieved successfully." if documents else "No documents found.",
         }
 
     except Exception as e:
@@ -254,42 +250,53 @@ async def get_documents_by_user_id(userId: str):
         capture_exception(e)
         return {"message": "Something went wrong", "success": False}
 
-async def check_doc_status(document_ids):
+async def check_doc_status(document_id):
     db = next(get_db())
     try:
-        documents = db["docSathi_ai_documents"].find({"_id": {"$in": document_ids}})
-        documents = list(documents)
-
-        if not documents:
+        # Convert string to ObjectId for MongoDB query
+        from bson import ObjectId
+        document_object_id = ObjectId(document_id)
+        
+        # Find the document by ObjectId
+        document = db["docSathi_ai_documents"].find_one({"_id": document_object_id})
+        
+        if not document:
             return {
                 "success": False,
-                "message": "No documents found",
-                "data": [],
+                "message": "No document found with the given ID",
+                "data": {},
             }
 
-        # Check agar koi bhi document processing me hai
-        for document in documents:
-            if document["status"] == "processing":
-                return {
-                    "success": False,
-                    "message": "Documents are still processing",
-                    "data": [],
-                }
-
-        # Agar koi bhi processing me nahi mila
-        return {
-            "success": True,
-            "message": "Documents are processed successfully",
-            "data": documents,
-        }
+        print("document----------", document)
+        
+        # Convert ObjectId to string for JSON serialization
+        document["_id"] = str(document["_id"])
+        
+        # Get document status
+        document_status = document.get("status", "unknown")
+        
+        # Check if status is processing
+        if document_status == "processing":
+            return {
+                "success": True,
+                "message": "Processing document",
+                "data": document,
+            }
+        else:
+            # For any other status, return success true with the status
+            return {
+                "success": True,
+                "message": f"Document status: {document_status}",
+                "data": document,
+            }
 
     except Exception as e:
         print("error in check_document_status", e)
         capture_exception(e)
         return {
             "success": False,
-            "message": "Something went wrong",
-            "data": [],
+            "message": f"Error checking document status: {str(e)}",
+            "data": {},
         }
 
 
@@ -305,10 +312,25 @@ async def process_single_file(file_data, document_format, doc_type):
     
     print(f"Processing file: {file_data.fileNameTime}")
     try:
+        # Extract S3 key from signed URL or use fileNameTime directly
+        # The signedUrl contains the full S3 key with path
+        s3_key = None
+        if file_data.signedUrl:
+            # Extract key from URL like: https://bucket.s3.amazonaws.com/vaktaAi/filename.pdf
+            from urllib.parse import urlparse, unquote
+            parsed_url = urlparse(file_data.signedUrl)
+            # Get path without leading slash and unquote URL encoding
+            s3_key = unquote(parsed_url.path.lstrip('/'))
+        else:
+            # Fallback to constructing key from fileNameTime
+            s3_key = f"vaktaAi/{file_data.fileNameTime}"
+        
+        print(f"Using S3 key: {s3_key}")
+        
         # Get file from S3
         s3_object = (
             s3_resources.Bucket(bucket_name)
-            .Object(f"vaktaAi/{file_data.fileNameTime}")
+            .Object(s3_key)
             .get()
         )
         file_data_content = s3_object["Body"].read()
@@ -341,7 +363,7 @@ async def process_single_file(file_data, document_format, doc_type):
         # Start training in a separate thread
         threading.Thread(
                 target=train_document,
-                args=(text, new_document_id, doc_type, "1"),
+                args=(text, new_document_id, doc_type),
             ).start()
         results.append({
             "fileName": file_data.fileNameTime,
@@ -408,7 +430,7 @@ async def process_file_data(file_data_list, document_format, doc_type):
             # Start training in a separate thread
             threading.Thread(
                     target=train_document,
-                    args=(text, new_document_id, doc_type, "1"),
+                    args=(text, new_document_id, doc_type),
                 ).start()
             results.append({
                 "fileName": document.fileNameTime,
@@ -469,7 +491,7 @@ async def process_single_website(website_url, doc_type):
         # Train the document
         threading.Thread(
                 target=train_document,
-                args=(scraped_data['text'], new_document_id, doc_type, "1"),
+                args=(scraped_data['text'], new_document_id, doc_type),
             ).start()
         
         results.append({
@@ -494,68 +516,6 @@ async def process_single_website(website_url, doc_type):
     return results
 
 
-async def process_website_urls(website_urls, doc_type):
-    """Process multiple website URLs (legacy function)"""
-    results = []
-    
-    for url in website_urls:
-        print(f"Processing website URL: {url}")
-        try:
-            # Scrape website content
-            scraped_data = scrape_website_content(url)
-            
-            if not scraped_data['text'].strip():
-                results.append({
-                    "source": "website",
-                    "url": url,
-                    "message": "No content extracted from website",
-                    "success": False,
-                })
-                continue
-            
-            # Generate document name from scraped content
-            doc_name = generate_document_name_from_text(scraped_data['text'], "website")
-            
-            # Add document record to Mongo
-            db = next(get_db())
-            doc_payload = DocSathiAIDocumentCreate(
-                user_id=1,  # TODO: Get actual user_id
-                name=doc_name,
-                url=url,
-                status="processing",
-                document_format="webUrl",
-                type=doc_type or "website",
-            )
-            
-            new_document_id = create_document(db, doc_payload.dict(exclude_none=True))
-            print(f"Website document created with ID: {new_document_id}")
-            
-            # Train the document
-            threading.Thread(
-                    target=train_document,
-                    args=(scraped_data['text'], new_document_id, doc_type, "1"),
-                ).start()
-            
-            results.append({
-                "source": "website",
-                "url": url,
-                "documentId": new_document_id,
-                "documentName": doc_name,
-                "message": "Website processed successfully",
-                "success": True,
-            })
-            
-        except Exception as web_error:
-            print(f"Error processing website URL {url}: {web_error}")
-            results.append({
-                "source": "website",
-                "url": url,
-                "message": f"Error processing website: {str(web_error)}",
-                "success": False,
-                "error": str(web_error),
-            })
-    
-    return results
 
 def get_video_id(url: str) -> str:
     """
@@ -627,7 +587,7 @@ async def process_single_youtube(youtube_url, doc_type):
         # Train the document
         threading.Thread(
                 target=train_document,
-                args=(data, new_document_id, doc_type, "1"),
+                args=(data, new_document_id, doc_type),
             ).start()
         
         results.append({
@@ -652,69 +612,6 @@ async def process_single_youtube(youtube_url, doc_type):
     return results
 
 
-async def process_youtube_urls(youtube_urls, doc_type):
-    """Process multiple YouTube URLs (legacy function)"""
-    results = []
-    
-    for url in youtube_urls:
-        print(f"Processing YouTube URL: {url}")
-        try:
-            # Extract transcript from YouTube
-            youtube_data = extract_youtube_transcript(url)
-            
-            if not youtube_data['text'].strip():
-                results.append({
-                    "source": "youtube",
-                    "url": url,
-                    "message": "No transcript extracted from YouTube video",
-                    "success": False,
-                })
-                continue
-            
-            # Generate document name from transcript
-            doc_name = generate_document_name_from_text(youtube_data['text'], "video")
-            
-            # Add document record to Mongo
-            db = next(get_db())
-            doc_payload = DocSathiAIDocumentCreate(
-                user_id=1,  # TODO: Get actual user_id
-                organization_id=1,  # TODO: Get actual org_id
-                name=doc_name,
-                url=url,
-                status="processing",
-                document_format="videoUrl",
-                type=doc_type or "video",
-            )
-            
-            new_document_id = create_document(db, doc_payload.dict(exclude_none=True))
-            print(f"YouTube document created with ID: {new_document_id}")
-            
-            # Train the document
-            threading.Thread(
-                    target=train_document,
-                    args=(youtube_data['text'], new_document_id, doc_type, "1"),
-                ).start()
-            
-            results.append({
-                "source": "youtube",
-                "url": url,
-                "documentId": new_document_id,
-                "documentName": doc_name,
-                "message": "YouTube video processed successfully",
-                "success": True,
-            })
-            
-        except Exception as youtube_error:
-            print(f"Error processing YouTube URL {url}: {youtube_error}")
-            results.append({
-                "source": "youtube",
-                "url": url,
-                "message": f"Error processing YouTube video: {str(youtube_error)}",
-                "success": False,
-                "error": str(youtube_error),
-            })
-    
-    return results
 
 
 # Utility functions for document processing 
@@ -722,8 +619,7 @@ async def process_youtube_urls(youtube_urls, doc_type):
 
 
 
-def train_document(text: str, document_id: str, document_type: str, org_id: str):
-    print(f"Entered train_document with type {document_type} and org_id {org_id}")
+def train_document(text: str, document_id: str, document_type: str,):
 
     try:
         db = next(get_db()) 
@@ -732,6 +628,7 @@ def train_document(text: str, document_id: str, document_type: str, org_id: str)
     
         # Generate meaningful chunks
         chunks = create_meaningful_chunks(text)
+        summary = asyncio.run(create_document_keypoints(chunks))
         print("v>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>train_document>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>",chunks)
         
         # Print Chunks
@@ -748,7 +645,6 @@ def train_document(text: str, document_id: str, document_type: str, org_id: str)
                     "meta_summary": "Default summary",
                     "chunk": item,
                     "training_document_id": ObjectId(document_id),
-                    "organization_id": org_id,
                     "created_ts": datetime.now(),
                     "updated_ts": datetime.now(),
                 })
@@ -758,13 +654,70 @@ def train_document(text: str, document_id: str, document_type: str, org_id: str)
 
         # Update document status to completed
         print(f"Updating document {document_id} status to completed")
-        update_document_status(db, document_id, {"status": "completed", "summary": "default summary", "updated_ts": datetime.now()})
+        update_document_status(db, document_id, {"status": "completed", "summary": summary, "updated_ts": datetime.now()})
 
     except Exception as e:
         print(f"Error in train_document: {e}")
         asyncio.run(delete_document_by_admin(document_id, False))
         update_document_status(db, document_id, {"status": "cancelled", "updated_ts": datetime.now()})
         capture_exception(e)
+
+async def create_document_keypoints(chunks: list) -> str:
+    """Generate document summary and keypoints using OpenAI"""
+    try:
+        if not chunks:
+            print("No chunks provided for summary generation")
+            return "No content available for summary."
+        
+        openai_client = start_openai()
+        
+        # Combine chunks (limit to avoid token issues)
+        combined_text = " ".join(chunks[:10])  # First 10 chunks
+        if len(combined_text) > 4000:
+            combined_text = combined_text[:4000]
+        
+        prompt = f"""
+        You are an advanced assistant specialized in summarizing long texts such as YouTube transcripts and documents.  
+        
+        ### Task:
+        - Analyze the provided text.  
+        - Extract the **most important key points** in clear, bullet-point form.  
+        - After the key points, provide a **short final summary (2-4 sentences)** that captures the overall meaning and essence of the text.  
+        - Keep the language **simple, clear, and easy to understand** (suitable for students up to class 12).  
+        - Avoid repetition, filler words, or irrelevant details.  
+        
+        ### Input Text:
+        {combined_text}
+        
+        ### Output Format:
+        **Key Points:**
+        - Point 1
+        - Point 2
+        - Point 3
+        
+        **Final Summary:**
+        <2-4 sentence summary here>
+        """
+        
+        print("Calling OpenAI for document summary...")
+        response = await openai_client.chat.completions.create(
+            model="gpt-3.5-turbo",
+            messages=[
+                {"role": "system", "content": "You are an expert document analyst. Provide clear, concise summaries and key points."},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.3,
+            max_tokens=1000
+        )
+        
+        summary = response.choices[0].message.content
+        print(f"Summary generated successfully: {summary[:100]}...")
+        return summary
+        
+    except Exception as e:
+        print(f"Error in create_document_keypoints: {e}")
+        capture_exception(e)
+        return "Could not generate summary due to an error."
 
 
 # delete document by document Id
@@ -952,46 +905,6 @@ def create_meaningful_chunks(text, similarity_threshold=0.5):
     except Exception as e:
         print(f"🚨 Unexpected error in create_meaningful_chunks: {e}")
         return [], ""
-
-
-
-
-def create_summary(text: list) -> str:
-    try:
-        word_count = len(text)  # Get document size
-        min_length, max_length = get_summary_length(word_count)  # Dynamic summary size
-        print("WORD COUNT--------------------cm,---------",word_count)
-        chunks = chunk_text(text, max_tokens=10000)  # Adjust chunk size
-        summaries = []
-
-        for i, chunk in enumerate(chunks):
-            print(f"Processing chunk {i+1}/{len(chunks)}")  # Debugging: print chunk progress
-            inputs = tokenizer(chunk, return_tensors="pt", max_length=10000,padding=True, truncation=True)
-            inputs = {key: value.to(device) for key, value in inputs.items()}
-            
-
-            # Generate Summary with Optimized Parameters
-            summary_ids = model.generate(
-                inputs["input_ids"],
-                max_length=max_length,
-                min_length=min_length,
-                num_beams=5,  # More beams for better sentence generation
-                length_penalty=1.0,  # Encourages complete sentences
-                no_repeat_ngram_size=3,  # Avoids repeating words
-                early_stopping=False  # Prevents premature summary cutoff
-            )
-
-            summary = tokenizer.decode(summary_ids[0], skip_special_tokens=True)
-            print("SUMMARY--------------------cm,---------",summary)
-            summaries.append(summary)
-
-        return " ".join(summaries)
-
-    except Exception as e:
-        print(f"🚨 Error in create_summary: {e}")
-        return "Could not generate summary due to an error."
- 
-
 
 
 
@@ -1212,3 +1125,807 @@ def extract_youtube_video_id(url):
         if match:
             return match.group(1)
     return None
+
+async def get_document_text_from_chunks(document_id: str):
+    """Common function to extract and join all chunks from a document"""
+    try:
+        from bson import ObjectId
+        
+        db = next(get_db())
+        
+        # Validate document_id
+        try:
+            doc_object_id = ObjectId(document_id)
+        except Exception:
+            return None, "Invalid document ID format"
+        
+        # Check if document exists
+        document = db["docSathi_ai_documents"].find_one({"_id": doc_object_id})
+        if not document:
+            return None, "Document not found"
+        
+        # Get all chunks for this document
+        chunks = list(db["chunks"].find({
+            "training_document_id": doc_object_id
+        }))
+        
+        if not chunks:
+            return None, "No chunks found for this document"
+        
+        # Combine all chunk text
+        combined_text = " ".join([chunk.get("chunk", "") for chunk in chunks])
+        
+        if not combined_text.strip():
+            return None, "No text content found in chunks"
+        
+        return combined_text, None
+        
+    except Exception as e:
+        print(f"Error in get_document_text_from_chunks: {e}")
+        return None, f"Error extracting document text: {str(e)}"
+
+async def generate_document_summary(document_id: str):
+    """Generate summary for a document based on its chunks"""
+    try:
+        # Use common function to get document text
+        combined_text, error = await get_document_text_from_chunks(document_id)
+        
+        if error:
+            return DocumentSummaryResponse(
+                success=False,
+                message=error
+            )
+        # summary = create_summary(combined_text)
+        # Calculate word count for context
+        word_count = len(combined_text.split())
+        
+        # Get chunks count for fallback
+        db = next(get_db())
+        from bson import ObjectId
+        doc_object_id = ObjectId(document_id)
+        chunks = list(db["chunks"].find({"training_document_id": doc_object_id}))
+        # print("summary>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>",summary)
+        # Generate summary using OpenAI
+        try:
+            
+            openai_client = start_openai()
+            
+            # Create prompt for summary generation
+            prompt = f"""
+            Please analyze the following document content and provide:
+            1. A comprehensive summary (2-3 paragraphs)
+            2. Key points (5-7 bullet points)
+            3. A descriptive title (3-8 words)
+            
+            Document Content:
+            {combined_text[:8000]}  # Limit to avoid token limits
+            
+            Please respond in the following JSON format:
+            {{
+                "summary": "Your comprehensive summary here",
+                "key_points": ["Point 1", "Point 2", "Point 3", "Point 4", "Point 5"],
+                "title": "Descriptive Title Here"
+            }}
+            """
+            
+            response = await openai_client.chat.completions.create(
+                model="gpt-3.5-turbo",
+                messages=[
+                    {"role": "system", "content": "You are an expert document analyst. Provide clear, concise summaries and key points."},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0.3,
+                max_tokens=1000
+            )
+            
+            # Parse the response
+            import json
+            try:
+                result = json.loads(response.choices[0].message.content)
+                summary = result.get("summary", "")
+                key_points = result.get("key_points", [])
+                title = result.get("title", "Document Summary")
+
+                print("summary>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>",summary)
+                print("key_points>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>",key_points)
+                print("title>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>",title)
+            except json.JSONDecodeError:
+                # Fallback if JSON parsing fails
+                content = response.choices[0].message.content
+                summary = content
+                key_points = ["Summary generated successfully"]
+                title = "Document Summary"
+            
+        except Exception as e:
+            print(f"Error generating summary with OpenAI: {e}")
+            # Fallback summary
+            summary = f"This document contains {word_count} words across {len(chunks)} sections. The content covers various topics and provides detailed information."
+            key_points = [
+                f"Document contains {word_count} words",
+                f"Split into {len(chunks)} sections",
+                "Content analysis completed",
+                "Summary generated successfully"
+            ]
+            title = "Document Summary"
+        
+        # Create response
+        document_summary = DocumentSummary(
+            summary=summary,
+            key_points=key_points,
+            title=title
+        )
+        
+        return DocumentSummaryResponse(
+            success=True,
+            message="Document summary generated successfully",
+            data=document_summary
+        )
+        
+    except Exception as e:
+        print(f"Error in generate_document_summary: {e}")
+        capture_exception(e)
+        return DocumentSummaryResponse(
+            success=False,
+            message=f"Error generating summary: {str(e)}"
+        )
+
+async def generate_document_notes(document_id: str):
+    """Generate notes for a document based on its chunks"""
+    try:
+        # Use common function to get document text
+        combined_text, error = await get_document_text_from_chunks(document_id)
+        
+        if error:
+            return DocumentNotesResponse(
+                success=False,
+                message=error
+            )
+        
+        # Generate notes using OpenAI
+        try:
+            openai_client = start_openai()
+            
+            # Create prompt for notes generation
+            prompt = f"""
+            Please analyze the following document content and create comprehensive study notes:
+            
+            Document Content:
+            {combined_text[:8000]}  # Limit to avoid token limits
+            
+            Please create detailed study notes with:
+            1. A descriptive title (3-8 words)
+            2. Key study notes (8-12 bullet points covering main concepts, important details, and insights)
+            
+            Please respond in the following JSON format:
+            {{
+                "title": "Study Notes Title",
+                "notes": [
+                    "Note 1: Main concept or important detail",
+                    "Note 2: Key insight or explanation",
+                    "Note 3: Supporting information",
+                    "Note 4: Additional context",
+                    "Note 5: Important facts or data",
+                    "Note 6: Key takeaways",
+                    "Note 7: Related concepts",
+                    "Note 8: Summary points"
+                ]
+            }}
+            """
+            
+            response = await openai_client.chat.completions.create(
+                model="gpt-3.5-turbo",
+                messages=[
+                    {"role": "system", "content": "You are an expert educator. Create comprehensive, well-structured study notes that help students understand and retain key information."},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0.3,
+                max_tokens=1500
+            )
+            
+            # Parse the response
+            import json
+            try:
+                result = json.loads(response.choices[0].message.content)
+                notes = result.get("notes", [])
+                title = result.get("title", "Document Notes")
+
+                print("notes>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>",notes)
+                print("title>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>",title)
+            except json.JSONDecodeError:
+                # Fallback if JSON parsing fails
+                content = response.choices[0].message.content
+                notes = [content]
+                title = "Document Notes"
+            
+        except Exception as e:
+            print(f"Error generating notes with OpenAI: {e}")
+            # Fallback notes
+            notes = [
+                "Document contains important information",
+                "Key concepts and details are present",
+                "Study material is comprehensive",
+                "Important insights and data included",
+                "Well-structured content for learning"
+            ]
+            title = "Document Notes"
+        
+        # Create response
+        document_notes = DocumentNotes(
+            notes=notes,
+            title=title
+        )
+        
+        return DocumentNotesResponse(
+            success=True,
+            message="Document notes generated successfully",
+            data=document_notes
+        )
+        
+    except Exception as e:
+        print(f"Error in generate_document_notes: {e}")
+        capture_exception(e)
+        return DocumentNotesResponse(
+            success=False,
+            message=f"Error generating notes: {str(e)}"
+        )
+
+
+async def generate_student_quiz(request: GenerateQuizRequest):
+    """Generate a complete student quiz with questions and save to database"""
+    try:
+        from bson import ObjectId
+        from app.database.mongo_collections import create_student_quiz, create_question_answer
+        
+        db = next(get_db())
+        
+        # Validate document exists
+        document = db["docSathi_ai_documents"].find_one({"_id": ObjectId(request.document_id)})
+        if not document:
+            return GenerateQuizResponse(
+                success=False,
+                message="Document not found"
+            )
+        
+        # Get document text using common function
+        combined_text, error = await get_document_text_from_chunks(request.document_id)
+        if error:
+            return GenerateQuizResponse(
+                success=False,
+                message=error
+            )
+        
+        # Create quiz in database
+        quiz_doc = {
+            "quiz_name": request.quiz_name,
+            "related_doc_id": ObjectId(request.document_id),
+            "created_by": request.user_id, #ObjectId(request.user_id)
+            "level": request.level,
+            "no_of_questions": request.number_of_questions,
+            "is_submitted": False,
+            "created_at": datetime.now(),
+            "updated_at": datetime.now()
+        }
+        
+        quiz_id = create_student_quiz(db, quiz_doc)
+        print(f"Quiz created with ID: {quiz_id}")
+        
+        # Generate questions using OpenAI
+        try:
+            openai_client = start_openai()
+            
+            # Create dynamic prompt based on level and number of questions
+            level_instructions = {
+                "easy": "Create simple, basic questions that test fundamental understanding",
+                "medium": "Create moderate difficulty questions that test comprehension and application",
+                "hard": "Create challenging questions that test deep understanding, analysis, and critical thinking"
+            }
+            
+            question_mix = {
+                "easy": "Include 70% MCQ and 30% True/False questions",
+                "medium": "Include 60% MCQ and 40% True/False questions", 
+                "hard": "Include 50% MCQ and 50% True/False questions"
+            }
+            
+            prompt = f"""
+            Please analyze the following document content and create a comprehensive quiz with {request.number_of_questions} questions.
+            
+            Document Content:
+            {combined_text[:8000]}  # Limit to avoid token limits
+            if document have no enough content or accurately to create quiz then you can create quiz with your own knowledge related to the document topic
+            
+            Quiz Requirements:
+            - Level: {request.level} ({level_instructions.get(request.level, 'medium')})
+            - Number of Questions: {request.number_of_questions}
+            - Question Mix: {question_mix.get(request.level, '60% MCQ, 40% True/False')}
+            - For MCQ: Provide 4 options (A, B, C, D)
+            - For True/False: Provide 2 options (True, False)
+            
+            Please respond in the following JSON format:
+            {{
+                "questions": [
+                    {{
+                        "question_type": "mcq",
+                        "question_text": "What is the main topic discussed in this document?",
+                        "options": ["Option A", "Option B", "Option C", "Option D"],
+                        "correct_answer": "Option A",
+                        "AI_explanation": "Detailed explanation of why this answer is correct"
+                    }},
+                    {{
+                        "question_type": "true_false",
+                        "question_text": "The document mentions that AI is the future of technology.",
+                        "options": ["True", "False"],
+                        "correct_answer": "True",
+                        "AI_explanation": "This statement is true because the document clearly states..."
+                    }}
+                ]
+            }}
+            """
+            
+            response = await openai_client.chat.completions.create(
+                model="gpt-3.5-turbo",
+                messages=[
+                    {"role": "system", "content": f"You are an expert quiz creator. Create {request.level} level questions that test understanding of the document content. Mix question types appropriately."},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0.3,
+                max_tokens=3000
+            )
+            
+            # Parse the response
+            import json
+            try:
+                result = json.loads(response.choices[0].message.content)
+                questions_data = result.get("questions", [])
+                
+                print(f"Generated {len(questions_data)} questions for quiz {quiz_id}")
+                
+                # Save each question to database
+                saved_questions = []
+                for i, q in enumerate(questions_data):
+                    question_doc = {
+                        "quiz_id": ObjectId(quiz_id),
+                        "question_type": q.get("question_type", "mcq"),
+                        "question_text": q.get("question_text", ""),
+                        "options": q.get("options", []),
+                        "correct_answer": q.get("correct_answer", ""),
+                        "student_answer": None,
+                        "AI_explanation": q.get("AI_explanation", ""),
+                        "created_at": datetime.now(),
+                        "updated_at": datetime.now()
+                    }
+                    
+                    question_id = create_question_answer(db, question_doc)
+                    saved_questions.append(question_id)
+                    print(f"Question {i+1} saved with ID: {question_id}")
+                
+                # Create response
+                student_quiz = StudentQuiz(
+                    quiz_name=request.quiz_name,
+                    related_doc_id=request.document_id,
+                    created_by=request.user_id,
+                    level=request.level,
+                    no_of_questions=request.number_of_questions,
+                    is_submitted=False,
+                    created_at=datetime.now(),
+                    updated_at=datetime.now()
+                )
+                
+                return GenerateQuizResponse(
+                    success=True,
+                    message=f"Quiz generated successfully with {len(saved_questions)} questions",
+                    data=student_quiz
+                )
+                
+            except json.JSONDecodeError:
+                print("Error parsing JSON response from OpenAI")
+                return GenerateQuizResponse(
+                    success=False,
+                    message="Error parsing quiz questions from AI response"
+                )
+            
+        except Exception as e:
+            print(f"Error generating questions with OpenAI: {e}")
+            return GenerateQuizResponse(
+                success=False,
+                message=f"Error generating questions: {str(e)}"
+            )
+        
+    except Exception as e:
+        print(f"Error in generate_student_quiz: {e}")
+        capture_exception(e)
+        return GenerateQuizResponse(
+            success=False,
+            message=f"Error generating quiz: {str(e)}"
+        )
+
+async def get_document_quizzes(document_id: str, created_by: str = None):
+    """Get all quizzes for a document, optionally filtered by creator"""
+    try:
+        from bson import ObjectId
+        from app.database.mongo_collections import get_student_quizs_by_doc, get_questions_by_quiz
+        
+        db = next(get_db())
+        
+        # Validate document exists
+        document = db["docSathi_ai_documents"].find_one({"_id": ObjectId(document_id)})
+        if not document:
+            return GetDocumentQuizzesResponse(
+                success=False,
+                message="Document not found"
+            )
+        
+        # Get quizzes for document
+        quizzes = get_student_quizs_by_doc(db, document_id)
+        
+        # Filter by created_by if provided
+        if created_by:
+            quizzes = [q for q in quizzes if str(q.get("created_by")) == created_by]
+        
+        if not quizzes:
+            return GetDocumentQuizzesResponse(
+                success=True,
+                message="No quizzes found for this document",
+                data=[]
+            )
+        
+        # Get questions for each quiz
+        quiz_responses = []
+        for quiz in quizzes:
+            quiz_id = str(quiz["_id"])
+            questions = get_questions_by_quiz(db, quiz_id)
+            
+            # Convert questions to response format
+            question_responses = []
+            is_quiz_submitted = quiz.get("is_submitted", False)
+            
+            for question in questions:
+                # Only show correct answer and AI explanation if quiz is submitted
+                if is_quiz_submitted:
+                    question_responses.append(QuizQuestionResponse(
+                        question_id=str(question["_id"]),
+                        question_type=question.get("question_type", "mcq"),
+                        question_text=question.get("question_text", ""),
+                        options=question.get("options", []),
+                        correct_answer=question.get("correct_answer", ""),
+                        student_answer=question.get("student_answer"),
+                        AI_explanation=question.get("AI_explanation", "")
+                    ))
+                else:
+                    # For non-submitted quizzes, hide correct answer and AI explanation
+                    question_responses.append(QuizQuestionResponse(
+                        question_id=str(question["_id"]),
+                        question_type=question.get("question_type", "mcq"),
+                        question_text=question.get("question_text", ""),
+                        options=question.get("options", []),
+                        correct_answer="",  # Hidden for non-submitted quizzes
+                        student_answer=question.get("student_answer"),
+                        AI_explanation=""  # Hidden for non-submitted quizzes
+                    ))
+            
+            # Create quiz response
+            quiz_response = QuizResponse(
+                quiz_id=quiz_id,
+                quiz_name=quiz.get("quiz_name", ""),
+                level=quiz.get("level", "medium"),
+                no_of_questions=quiz.get("no_of_questions", 0),
+                is_submitted=quiz.get("is_submitted", False),
+                created_at=quiz.get("created_at", datetime.now()),
+                updated_at=quiz.get("updated_at", datetime.now()),
+                questions=question_responses
+            )
+            
+            quiz_responses.append(quiz_response)
+        
+        return GetDocumentQuizzesResponse(
+            success=True,
+            message=f"Found {len(quiz_responses)} quiz(es) for document",
+            data=quiz_responses
+        )
+        
+    except Exception as e:
+        print(f"Error in get_document_quizzes: {e}")
+        capture_exception(e)
+        return GetDocumentQuizzesResponse(
+            success=False,
+            message=f"Error fetching quizzes: {str(e)}"
+        )
+
+async def submit_quiz(quiz_id: str, answers: list[dict]):
+    """Submit quiz answers and calculate score"""
+    try:
+        from bson import ObjectId
+        from app.database.mongo_collections import get_student_quiz, get_questions_by_quiz, update_question_answer, update_student_quiz
+        
+        db = next(get_db())
+        
+        # Validate quiz exists
+        quiz = get_student_quiz(db, quiz_id)
+        if not quiz:
+            return SubmitQuizResponse(
+                success=False,
+                message="Quiz not found"
+            )
+        
+        # Check if quiz already submitted
+        if quiz.get("is_submitted", False):
+            return SubmitQuizResponse(
+                success=False,
+                message="Quiz already submitted"
+            )
+        
+        # Get all questions for this quiz
+        questions = get_questions_by_quiz(db, quiz_id)
+        if not questions:
+            return SubmitQuizResponse(
+                success=False,
+                message="No questions found for this quiz"
+            )
+        
+        # Create answer mapping for quick lookup
+        answer_map = {ans["question_id"]: ans["selected_answer"] for ans in answers}
+        
+        # Process each question and calculate score
+        correct_answers = 0
+        wrong_answers = 0
+        total_questions = len(questions)
+        processed_questions = []
+        
+        for question in questions:
+            question_id = str(question["_id"])
+            selected_answer = answer_map.get(question_id, "")
+            correct_answer = question.get("correct_answer", "")
+            
+            # Check if answer is correct
+            is_correct = selected_answer.strip() == correct_answer.strip()
+            
+            if is_correct:
+                correct_answers += 1
+            else:
+                wrong_answers += 1
+            
+            # Update question with student answer
+            update_question_answer(db, question_id, {
+                "student_answer": selected_answer,
+                "updated_at": datetime.now()
+            })
+            
+            # Create question response for result
+            processed_questions.append(QuizQuestionResponse(
+                question_id=question_id,
+                question_type=question.get("question_type", "mcq"),
+                question_text=question.get("question_text", ""),
+                options=question.get("options", []),
+                correct_answer=correct_answer,
+                student_answer=selected_answer,
+                AI_explanation=question.get("AI_explanation", "")
+            ))
+        
+        # Calculate score and percentage
+        score = correct_answers
+        percentage = (correct_answers / total_questions) * 100 if total_questions > 0 else 0
+        
+        # Update quiz as submitted
+        update_student_quiz(db, quiz_id, {
+            "is_submitted": True,
+            "score": score,
+            "percentage": percentage,
+            "submitted_at": datetime.now(),
+            "updated_at": datetime.now()
+        })
+        
+        # Create submission result
+        submission_result = QuizSubmissionResult(
+            quiz_id=quiz_id,
+            score=score,
+            total_questions=total_questions,
+            correct_answers=correct_answers,
+            wrong_answers=wrong_answers,
+            percentage=round(percentage, 2),
+            submitted_at=datetime.now(),
+            questions=processed_questions
+        )
+        
+        return SubmitQuizResponse(
+            success=True,
+            message=f"Quiz submitted successfully. Score: {score}/{total_questions} ({percentage:.1f}%)",
+            data=submission_result
+        )
+        
+    except Exception as e:
+        print(f"Error in submit_quiz: {e}")
+        capture_exception(e)
+        return SubmitQuizResponse(
+            success=False,
+            message=f"Error submitting quiz: {str(e)}"
+        )
+
+async def get_document_text(document_id: str):
+    """Get combined text content from document chunks"""
+    try:
+        from bson import ObjectId
+        
+        db = next(get_db())
+        
+        # Validate document_id
+        try:
+            doc_object_id = ObjectId(document_id)
+        except Exception:
+            return DocumentTextResponse(
+                success=False,
+                message="Invalid document ID format"
+            )
+        
+        # Get document details
+        document = db["docSathi_ai_documents"].find_one({"_id": doc_object_id})
+        if not document:
+            return DocumentTextResponse(
+                success=False,
+                message="Document not found"
+            )
+        
+        # Use the common function to get document text
+        combined_text, error = await get_document_text_from_chunks(document_id)
+        
+        if error:
+            return DocumentTextResponse(
+                success=False,
+                message=error
+            )
+        
+        # Return the text content with type information and document URL
+        return DocumentTextResponse(
+            success=True,
+            message="Document text retrieved successfully",
+            data={
+                "content": combined_text,
+                "type": "text",
+                "document_url": document.get("url", ""),
+                "document_name": document.get("name", ""),
+                "summary": document.get("summary", ""),
+                "document_format": document.get("document_format", "")
+            }
+        )
+        
+    except Exception as e:
+        print(f"Error in get_document_text: {e}")
+        capture_exception(e)
+        return DocumentTextResponse(
+            success=False,
+            message=f"Error retrieving document text: {str(e)}"
+        )
+
+async def get_document_chats(document_id: str, limit: int = 20, offset: int = 0):
+    """Get all chats for a document with pagination"""
+    try:
+        from bson import ObjectId
+        
+        db = next(get_db())
+        
+        # Validate document_id
+        try:
+            doc_object_id = ObjectId(document_id)
+        except Exception:
+            return DocumentChatsResponse(
+                success=False,
+                message="Invalid document ID format"
+            )
+        
+        # Check if document exists
+        document = db["docSathi_ai_documents"].find_one({"_id": doc_object_id})
+        if not document:
+            return DocumentChatsResponse(
+                success=False,
+                message="Document not found"
+            )
+        
+        # Limit validation
+        if limit > 50:
+            limit = 50
+        if limit < 1:
+            limit = 20
+        if offset < 0:
+            offset = 0
+        
+        # Get chats for this document with pagination
+        chats_cursor = db["chats"].find({
+            "document_id": doc_object_id,
+            "status": "active"
+        }).sort("created_at", -1).skip(offset).limit(limit)
+        
+        chats = list(chats_cursor)
+        
+        if not chats:
+            return DocumentChatsResponse(
+                success=True,
+                message="No chats found for this document",
+                data=[]
+            )
+        
+        # Convert to response format
+        chat_list = []
+        for chat in chats:
+            # Get last message and message count for each chat
+            last_message = ""
+            message_count = 0
+            
+            # Get last message
+            last_msg_cursor = db["chat_messages"].find({
+                "chat_id": chat["_id"]
+            }).sort("created_ts", -1).limit(1)
+            
+            last_msg = list(last_msg_cursor)
+            if last_msg:
+                last_message = last_msg[0].get("message", "")
+            
+            # Get message count
+            message_count = db["chat_messages"].count_documents({
+                "chat_id": chat["_id"]
+            })
+            
+            chat_list.append(DocumentChat(
+                chat_id=str(chat["_id"]),
+                document_id=str(chat.get("document_id", "")),
+                user_id=str(chat.get("user_id", "")),
+                created_at=chat.get("created_at", datetime.now()),
+                updated_at=chat.get("updated_at", datetime.now()),
+                last_message=last_message,
+                message_count=message_count,
+                title=chat.get("title", f"Chat {str(chat['_id'])[:8]}")  # Use existing title from chat
+            ))
+        
+        return DocumentChatsResponse(
+            success=True,
+            message=f"Found {len(chat_list)} chat(s) for document",
+            data=chat_list
+        )
+        
+    except Exception as e:
+        print(f"Error in get_document_chats: {e}")
+        capture_exception(e)
+        return DocumentChatsResponse(
+            success=False,
+            message=f"Error retrieving document chats: {str(e)}"
+        )
+
+
+
+def chunk_text(text, max_tokens=10000):
+    sentences = sent_tokenize(text)  # Split text into sentences
+    chunks = []
+    current_chunk = []
+    current_length = 0
+
+    for sentence in sentences:
+        tokenized_sentence = tokenizer.encode(sentence, add_special_tokens=False)
+        sentence_length = len(tokenized_sentence)
+
+        # If adding this sentence exceeds max_tokens, finalize the chunk
+        if current_length + sentence_length > max_tokens:
+            if current_chunk:  # Ensure we don't create empty chunks
+                chunks.append(" ".join(current_chunk))
+            current_chunk = [sentence]  # Start a new chunk with this sentence
+            current_length = sentence_length
+        else:
+            current_chunk.append(sentence)
+            current_length += sentence_length
+
+    # Add last chunk if any sentences remain
+    if current_chunk:
+        chunks.append(" ".join(current_chunk))
+
+    return chunks
+
+
+# 🔹 Optimized Function to Dynamically Adjust Summary Length
+def get_summary_length(word_count):
+    if word_count <= 1000:
+        return 100, 200  # Short documents
+    elif word_count <= 5000:
+        return 150, 300  # Medium documents
+    elif word_count <= 10000:
+        return 300, 600  # Long documents
+    else:
+        return 500, 1000  # Very Large documents
+
+
+# 🔹 Optimized Summarization Function with Sentence-Aware Chunking & Parameter Tweaks

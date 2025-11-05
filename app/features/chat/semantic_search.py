@@ -8,7 +8,7 @@ from app.common import constants
 
 
 from pymilvus import MilvusException, SearchResult
-from app.utils.transformers.models import msmarco_model
+from app.utils.transformers.models import msmarco_model ,multi_qa_mpnet_model
 from sqlalchemy.orm import Session
 
 
@@ -87,30 +87,39 @@ class BotGraphMixin:
         mongo_document_id: str = None,
     ):
         try:
-            print("questions>>>>>>>>in milvus>>>>>>>>>>>>>>",questions)
+            
+            print("questions>>>>>>>>in milvus>>>>>>model>>>>>>>>", model)
             encoded_embedding = model.encode(
                 questions, normalize_embeddings=True
             ).tolist()
 
             search_params = {"metric_type": "IP"}
             filter_condition = None
+
             if mongo_document_id:
-                filter_condition = f"mongo_document_id == {mongo_document_id}"
+                # Wrap the ID in quotes because it's stored as a string in Milvus
+                filter_condition = f'mongo_document_id == "{mongo_document_id}"'
 
             response: SearchResult = await sync_to_async(collection.search)(
                 [encoded_embedding],
                 "vector",
                 search_params,
                 limit=constants.MILVUS_TOP_K_LIMIT,
-                output_fields=["id","mongo_chunk_id"],
+                
+                output_fields=["id", "mongo_chunk_id"],
                 expr=filter_condition,
             )
-            print("response>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>_get_milvus_response>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>",response)
-        except MilvusException as e:
-            return None
 
+            print(
+                "response>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>_get_milvus_response>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>",
+                response,
+            )
+        except MilvusException as e:
+            print(f"Milvus error: {e}")
+            return None
         else:
             return response
+
 
     def _get_milvus_id(
         self,
@@ -252,7 +261,7 @@ class BotGraphMixin:
 
         try:
             msmarco_results = await self._search_answers_vector(
-                collection, msmarco_model, questions, mongo_document_id
+                collection, multi_qa_mpnet_model, questions, mongo_document_id
             )
             print("msmarco_results type:", type(msmarco_results))
             print("msmarco_results content:", msmarco_results)
