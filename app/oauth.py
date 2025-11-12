@@ -26,7 +26,7 @@ async def is_user_authorized(
     try:
         token = credentials.credentials
         jwt_token = jwe.decrypt(token, "agent_ai_secret_id".ljust(16)[:16] )
-
+        print(jwt_token, "jwt_token")
         payload = jwt.decode(
             jwt_token, env_data.get("SECRET_KEY"), algorithms=env_data.get("ALGORITHM")
         )
@@ -80,7 +80,7 @@ async def is_user_authorized(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail={"error": constants.SESSION_EXPIRED},
             )
-
+        print(id, email, user_type, "id, email, user_type")
         return {"id": id, "email": email, "role_type": user_type}
     except Exception as e:
         print(e, "Exception")

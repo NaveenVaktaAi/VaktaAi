@@ -74,9 +74,9 @@ class ResponseCreator:
             try:
                 await asyncio.wait_for(_handle_response_inner(), timeout=30)
             except asyncio.TimeoutError:
-                print("Loop exceeded 30 seconds.")
+                pass  # ✅ OPTIMIZATION: Removed verbose logging
             except Exception as e:
-                print(f"An error occurred: {e}")
+                pass  # ✅ OPTIMIZATION: Removed verbose logging
             return main_response
 
         async def _handle_response_inner():
@@ -92,27 +92,19 @@ class ResponseCreator:
                     )
                     chat_history = ChatMessageHistory()
                     
-                    print("chat_id----==================chat id------", chat_id)
-                    print("modelName----==================model name------", modelName)
-                    print("max_output_tokens----==================max output tokens------", max_output_tokens) 
-                    
                     db = next(get_db())
-                    # Get recent chat messages from MongoDB
-                    results = get_chat_messages(db, str(chat_id), limit=10, skip=0)
-                    # Reverse to get most recent first
+                    # ✅ OPTIMIZATION: Reduce limit from 10 to 5 for faster queries
+                    results = get_chat_messages(db, str(chat_id), limit=5, skip=0)
                     results = list(reversed(results))
-                    print("results----==================results------", results)
                     
                     # Format chat history
                     chat_history_text = "\n".join(
                         [f"{'User' if not msg['is_bot'] else 'AI'}: {msg['message']}" for msg in results]
                     )
-                    print("chat_history_text----==================chat history text------", chat_history_text)
 
                     chat_history_text += f"\nUser: {user_query}\n"
                     chat_history.add_user_message(user_query)
 
-                    print("chat_history_messages----==================chat history messages------", chat_history.messages)
                     prompt = ChatPromptTemplate.from_messages(
                         [
                             f"""
@@ -135,7 +127,6 @@ class ResponseCreator:
                         ]
                     )
 
-                    print("================INSIDE PROMPT===============")
                     MessagesPlaceholder(variable_name="messages")
                     chain = prompt | chat
                     completion = chain.astream({"messages": chat_history.messages})

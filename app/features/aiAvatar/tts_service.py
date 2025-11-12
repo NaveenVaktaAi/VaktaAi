@@ -10,6 +10,7 @@ import json
 import uuid
 from pathlib import Path
 from app.features.chat.utils.response import ResponseCreator
+from app.features.aiAvatar.audio_compression import audio_compression
 
 logger = logging.getLogger(__name__)
 
@@ -156,13 +157,33 @@ class ImprovedTTSService:
             
             logger.info(f"[TTS] ✅ Audio generated: {len(audio_bytes)} bytes")
             
-            # Save audio to file instead of base64
-            audio_filename = f"audio_{uuid.uuid4().hex[:12]}.mp3"
+            # 🚀 Compress audio to reduce bandwidth (50-60% reduction)
+            original_size = len(audio_bytes)
+            compressed_audio_bytes = audio_bytes
+            is_compressed = False
+            compression_result = None
+            
+            if audio_compression.should_compress(original_size):
+                try:
+                    compression_result = await audio_compression.compress(audio_bytes)
+                    compressed_audio_bytes = compression_result['compressed']
+                    is_compressed = True
+                    logger.info(
+                        f"[TTS] 🗜️ Audio compressed: {original_size} → {compression_result['compressed_size']} bytes "
+                        f"({compression_result['compression_ratio']:.1f}% saved)"
+                    )
+                except Exception as e:
+                    logger.warning(f"[TTS] ⚠️ Compression failed, using original: {e}")
+                    compressed_audio_bytes = audio_bytes
+                    compression_result = None
+            
+            # Save audio to file (compressed or original)
+            audio_filename = f"audio_{uuid.uuid4().hex[:12]}.mp3{'z' if is_compressed else ''}"
             audio_filepath = AUDIO_FILES_DIR / audio_filename
             
-            # Write audio bytes to file
+            # Write audio bytes to file (compressed if compression was applied)
             with open(audio_filepath, 'wb') as f:
-                f.write(audio_bytes)
+                f.write(compressed_audio_bytes)
             
             # Create URL path for frontend
             # Get backend URL from environment or use default
@@ -226,7 +247,11 @@ class ImprovedTTSService:
                 "format": "mp3",
                 "context": context,
                 "phonemes": phonemes,  # Keep inline phonemes for backward compatibility
-                "phoneme_count": len(phonemes) if phonemes else 0
+                "phoneme_count": len(phonemes) if phonemes else 0,
+                # Compression info for frontend
+                "is_compressed": is_compressed,
+                "original_size": original_size if is_compressed else len(compressed_audio_bytes),
+                "compressed_size": len(compressed_audio_bytes)
             }
             
             logger.info(f"[TTS] 🎭 AWS Polly audio with {len(phonemes)} visemes (phonemes) ready for frontend")

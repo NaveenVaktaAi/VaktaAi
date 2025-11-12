@@ -16,6 +16,7 @@ class UploadDocuments(BaseModel):
     type: Optional[str] = None
     website_url: Optional[str] = Field(None, alias="WebsiteUrl")   # single URL instead of array
     youtube_url: Optional[str] = Field(None, alias="YoutubeUrl")   # single URL instead of array
+    url: Optional[str] = Field(None, alias="Url")  # ✅ Single URL field - backend will auto-detect type
     document_format: Optional[str] = Field(None, alias="documentFormat")
 
 

@@ -1,9 +1,10 @@
-from fastapi import APIRouter, HTTPException, Query, Path, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, HTTPException, Query, Path, WebSocket, WebSocketDisconnect, Depends
 from typing import List, Optional
 import json
 import asyncio
 from datetime import datetime
 
+from app.features.auth.router import get_current_user
 from app.features.chat.repository import ChatRepository
 from app.features.chat.schemas import (
     ChatCreate, ChatUpdate, ChatResponse, ChatMessageCreate, 
@@ -18,10 +19,28 @@ router = APIRouter(prefix="/chat", tags=["chat"])
 running_tasks = {}
 
 
+def check_chat_ownership(chat: dict, authenticated_user_id: str) -> None:
+    """Helper function to check if chat belongs to authenticated user"""
+    chat_user_id = str(chat.get("user_id", ""))
+    if chat_user_id != str(authenticated_user_id):
+        raise HTTPException(status_code=403, detail="Access denied: You can only access your own chats")
+
+
 @router.post("/", response_model=dict)
-async def create_chat(chat_data: ChatCreate):
+async def create_chat(
+    chat_data: ChatCreate,
+    current_user: dict = Depends(get_current_user)
+):
     """Create a new chat"""
     try:
+        # Get authenticated user ID
+        user_id = current_user.get("_id") or current_user.get("id")
+        if not user_id:
+            raise HTTPException(status_code=401, detail="User ID not found in token")
+        
+        # Override user_id with authenticated user's ID for security
+        chat_data.user_id = str(user_id)
+        
         chat_repo = ChatRepository()
         chat_id = await chat_repo.create_chat(chat_data)
         return {
@@ -31,35 +50,58 @@ async def create_chat(chat_data: ChatCreate):
                 "chat_id": chat_id
             }
         }
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error creating chat: {str(e)}")
 
 @router.get("/user/{user_id}", response_model=ChatListResponse)
 async def get_user_chats(
-    user_id: int = Path(..., description="User ID"),
+    user_id: str = Path(..., description="User ID"),
     page: int = Query(1, ge=1, description="Page number"),
-    limit: int = Query(20, ge=1, le=100, description="Number of chats per page")
+    limit: int = Query(20, ge=1, le=100, description="Number of chats per page"),
+    current_user: dict = Depends(get_current_user)
 ):
     """Get all chats for a user"""
     try:
+        # Use authenticated user's ID instead of path parameter for security
+        authenticated_user_id = current_user.get("_id") or current_user.get("id")
+        if not authenticated_user_id:
+            raise HTTPException(status_code=401, detail="User ID not found in token")
+        
         chat_repo = ChatRepository()
-        return await chat_repo.get_user_chats(user_id, page, limit)
+        return await chat_repo.get_user_chats(str(authenticated_user_id), page, limit)
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error fetching user chats: {str(e)}")
 
 
 @router.get("/{chat_id}", response_model=ChatResponse)
-async def get_chat(chat_id: str = Path(..., description="Chat ID")):
+async def get_chat(
+    chat_id: str = Path(..., description="Chat ID"),
+    current_user: dict = Depends(get_current_user)
+):
     """Get a specific chat"""
     try:
+        # Get authenticated user ID
+        authenticated_user_id = current_user.get("_id") or current_user.get("id")
+        if not authenticated_user_id:
+            raise HTTPException(status_code=401, detail="User ID not found in token")
+        
         chat_repo = ChatRepository()
         chat = await chat_repo.get_chat_by_id(chat_id)
         if not chat:
             raise HTTPException(status_code=404, detail="Chat not found")
         
+        # Authorization check: ensure user can only access their own chats
+        chat_user_id = str(chat.get("user_id", ""))
+        if chat_user_id != str(authenticated_user_id):
+            raise HTTPException(status_code=403, detail="Access denied: You can only access your own chats")
+        
         return ChatResponse(
             _id=str(chat["_id"]),
-            user_id=chat["user_id"],
+            user_id=str(chat["user_id"]),  # Convert to string
             document_id=str(chat["document_id"]) if chat.get("document_id") else None,
             title=chat["title"],
             status=chat["status"],
@@ -75,16 +117,27 @@ async def get_chat(chat_id: str = Path(..., description="Chat ID")):
 @router.put("/{chat_id}", response_model=dict)
 async def update_chat(
     chat_id: str = Path(..., description="Chat ID"),
-    chat_data: ChatUpdate = None
+    chat_data: ChatUpdate = None,
+    current_user: dict = Depends(get_current_user)
 ):
     """Update a chat"""
     try:
+        # Get authenticated user ID
+        authenticated_user_id = current_user.get("_id") or current_user.get("id")
+        if not authenticated_user_id:
+            raise HTTPException(status_code=401, detail="User ID not found in token")
+        
         chat_repo = ChatRepository()
         
-        # Check if chat exists
+        # Check if chat exists and belongs to user
         chat = await chat_repo.get_chat_by_id(chat_id)
         if not chat:
             raise HTTPException(status_code=404, detail="Chat not found")
+        
+        # Authorization check
+        chat_user_id = str(chat.get("user_id", ""))
+        if chat_user_id != str(authenticated_user_id):
+            raise HTTPException(status_code=403, detail="Access denied: You can only update your own chats")
         
         success = await chat_repo.update_chat(chat_id, chat_data)
         if success:
@@ -104,15 +157,28 @@ async def update_chat(
 
 
 @router.delete("/{chat_id}", response_model=dict)
-async def delete_chat(chat_id: str = Path(..., description="Chat ID")):
+async def delete_chat(
+    chat_id: str = Path(..., description="Chat ID"),
+    current_user: dict = Depends(get_current_user)
+):
     """Delete a chat and all its messages"""
     try:
+        # Get authenticated user ID
+        authenticated_user_id = current_user.get("_id") or current_user.get("id")
+        if not authenticated_user_id:
+            raise HTTPException(status_code=401, detail="User ID not found in token")
+        
         chat_repo = ChatRepository()
         
-        # Check if chat exists
+        # Check if chat exists and belongs to user
         chat = await chat_repo.get_chat_by_id(chat_id)
         if not chat:
             raise HTTPException(status_code=404, detail="Chat not found")
+        
+        # Authorization check
+        chat_user_id = str(chat.get("user_id", ""))
+        if chat_user_id != str(authenticated_user_id):
+            raise HTTPException(status_code=403, detail="Access denied: You can only delete your own chats")
         
         success = await chat_repo.delete_chat(chat_id)
         if success:
@@ -132,16 +198,27 @@ async def delete_chat(chat_id: str = Path(..., description="Chat ID")):
 async def get_chat_messages(
     chat_id: str = Path(..., description="Chat ID"),
     page: int = Query(1, ge=1, description="Page number"),
-    limit: int = Query(50, ge=1, le=100, description="Number of messages per page")
+    limit: int = Query(50, ge=1, le=100, description="Number of messages per page"),
+    current_user: dict = Depends(get_current_user)
 ):
     """Get messages for a chat"""
     try:
+        # Get authenticated user ID
+        authenticated_user_id = current_user.get("_id") or current_user.get("id")
+        if not authenticated_user_id:
+            raise HTTPException(status_code=401, detail="User ID not found in token")
+        
         chat_repo = ChatRepository()
         
-        # Check if chat exists
+        # Check if chat exists and belongs to user
         chat = await chat_repo.get_chat_by_id(chat_id)
         if not chat:
             raise HTTPException(status_code=404, detail="Chat not found")
+        
+        # Authorization check
+        chat_user_id = str(chat.get("user_id", ""))
+        if chat_user_id != str(authenticated_user_id):
+            raise HTTPException(status_code=403, detail="Access denied: You can only access your own chats")
         
         messages = await chat_repo.get_chat_messages(chat_id, page, limit)
         return messages
@@ -154,17 +231,28 @@ async def get_chat_messages(
 @router.post("/{chat_id}/messages", response_model=dict)
 async def create_chat_message(
     chat_id: str = Path(..., description="Chat ID"),
-    message_data: ChatMessageCreate = None
+    message_data: ChatMessageCreate = None,
+    current_user: dict = Depends(get_current_user)
 ):
     """Create a new message in a chat"""
     try:
+        # Get authenticated user ID
+        authenticated_user_id = current_user.get("_id") or current_user.get("id")
+        if not authenticated_user_id:
+            raise HTTPException(status_code=401, detail="User ID not found in token")
+        
         chat_repo = ChatRepository()
         print(">>>>>>>>>>>>>>>>>================chat  id in create_chat_message>>>>>>>>>>>>>>>>>",chat_id)
-        # Check if chat exists
+        # Check if chat exists and belongs to user
         chat = await chat_repo.get_chat_by_id(chat_id)
         print("chat>>>>>>>>>>>>>>>>>>>in create_chat_message=======>",chat)
         if not chat:
             raise HTTPException(status_code=404, detail="Chat not found")
+        
+        # Authorization check
+        chat_user_id = str(chat.get("user_id", ""))
+        if chat_user_id != str(authenticated_user_id):
+            raise HTTPException(status_code=403, detail="Access denied: You can only send messages to your own chats")
         
         # Set chat_id in message data
         message_data.chat_id = chat_id
@@ -185,16 +273,24 @@ async def create_chat_message(
 @router.get("/{chat_id}/messages/{message_id}", response_model=ChatMessageResponse)
 async def get_chat_message(
     chat_id: str = Path(..., description="Chat ID"),
-    message_id: str = Path(..., description="Message ID")
+    message_id: str = Path(..., description="Message ID"),
+    current_user: dict = Depends(get_current_user)
 ):
     """Get a specific chat message"""
     try:
+        # Get authenticated user ID
+        authenticated_user_id = current_user.get("_id") or current_user.get("id")
+        if not authenticated_user_id:
+            raise HTTPException(status_code=401, detail="User ID not found in token")
+        
         chat_repo = ChatRepository()
         
-        # Check if chat exists
+        # Check if chat exists and belongs to user
         chat = await chat_repo.get_chat_by_id(chat_id)
         if not chat:
             raise HTTPException(status_code=404, detail="Chat not found")
+        
+        check_chat_ownership(chat, str(authenticated_user_id))
         
         message = await chat_repo.get_chat_message_by_id(message_id)
         if not message:
@@ -209,6 +305,7 @@ async def get_chat_message(
             token=message.get("token"),
             type=message.get("type", "text"),
             is_edited=message.get("is_edited", False),
+            citation=message.get("citation"),  # Include citation in response
             created_ts=message["created_ts"],
             updated_ts=message["updated_ts"]
         )
@@ -222,16 +319,24 @@ async def get_chat_message(
 async def update_chat_message(
     chat_id: str = Path(..., description="Chat ID"),
     message_id: str = Path(..., description="Message ID"),
-    message_data: ChatMessageUpdate = None
+    message_data: ChatMessageUpdate = None,
+    current_user: dict = Depends(get_current_user)
 ):
     """Update a chat message"""
     try:
+        # Get authenticated user ID
+        authenticated_user_id = current_user.get("_id") or current_user.get("id")
+        if not authenticated_user_id:
+            raise HTTPException(status_code=401, detail="User ID not found in token")
+        
         chat_repo = ChatRepository()
         
-        # Check if chat exists
+        # Check if chat exists and belongs to user
         chat = await chat_repo.get_chat_by_id(chat_id)
         if not chat:
             raise HTTPException(status_code=404, detail="Chat not found")
+        
+        check_chat_ownership(chat, str(authenticated_user_id))
         
         # Check if message exists
         message = await chat_repo.get_chat_message_by_id(message_id)
@@ -258,16 +363,24 @@ async def update_chat_message(
 @router.delete("/{chat_id}/messages/{message_id}", response_model=dict)
 async def delete_chat_message(
     chat_id: str = Path(..., description="Chat ID"),
-    message_id: str = Path(..., description="Message ID")
+    message_id: str = Path(..., description="Message ID"),
+    current_user: dict = Depends(get_current_user)
 ):
     """Delete a chat message"""
     try:
+        # Get authenticated user ID
+        authenticated_user_id = current_user.get("_id") or current_user.get("id")
+        if not authenticated_user_id:
+            raise HTTPException(status_code=401, detail="User ID not found in token")
+        
         chat_repo = ChatRepository()
         
-        # Check if chat exists
+        # Check if chat exists and belongs to user
         chat = await chat_repo.get_chat_by_id(chat_id)
         if not chat:
             raise HTTPException(status_code=404, detail="Chat not found")
+        
+        check_chat_ownership(chat, str(authenticated_user_id))
         
         # Check if message exists
         message = await chat_repo.get_chat_message_by_id(message_id)
@@ -292,16 +405,24 @@ async def delete_chat_message(
 async def add_reaction_to_message(
     chat_id: str = Path(..., description="Chat ID"),
     message_id: str = Path(..., description="Message ID"),
-    reaction: str = Query(..., description="Reaction emoji")
+    reaction: str = Query(..., description="Reaction emoji"),
+    current_user: dict = Depends(get_current_user)
 ):
     """Add reaction to a message"""
     try:
+        # Get authenticated user ID
+        authenticated_user_id = current_user.get("_id") or current_user.get("id")
+        if not authenticated_user_id:
+            raise HTTPException(status_code=401, detail="User ID not found in token")
+        
         chat_repo = ChatRepository()
         
-        # Check if chat exists
+        # Check if chat exists and belongs to user
         chat = await chat_repo.get_chat_by_id(chat_id)
         if not chat:
             raise HTTPException(status_code=404, detail="Chat not found")
+        
+        check_chat_ownership(chat, str(authenticated_user_id))
         
         # Check if message exists
         message = await chat_repo.get_chat_message_by_id(message_id)
@@ -325,16 +446,24 @@ async def add_reaction_to_message(
 @router.delete("/{chat_id}/messages/{message_id}/reaction", response_model=dict)
 async def remove_reaction_from_message(
     chat_id: str = Path(..., description="Chat ID"),
-    message_id: str = Path(..., description="Message ID")
+    message_id: str = Path(..., description="Message ID"),
+    current_user: dict = Depends(get_current_user)
 ):
     """Remove reaction from a message"""
     try:
+        # Get authenticated user ID
+        authenticated_user_id = current_user.get("_id") or current_user.get("id")
+        if not authenticated_user_id:
+            raise HTTPException(status_code=401, detail="User ID not found in token")
+        
         chat_repo = ChatRepository()
         
-        # Check if chat exists
+        # Check if chat exists and belongs to user
         chat = await chat_repo.get_chat_by_id(chat_id)
         if not chat:
             raise HTTPException(status_code=404, detail="Chat not found")
+        
+        check_chat_ownership(chat, str(authenticated_user_id))
         
         # Check if message exists
         message = await chat_repo.get_chat_message_by_id(message_id)
@@ -359,11 +488,23 @@ async def remove_reaction_from_message(
 async def get_chat_with_messages(
     chat_id: str = Path(..., description="Chat ID"),
     page: int = Query(1, ge=1, description="Page number for messages"),
-    limit: int = Query(50, ge=1, le=100, description="Number of messages per page")
+    limit: int = Query(50, ge=1, le=100, description="Number of messages per page"),
+    current_user: dict = Depends(get_current_user)
 ):
     """Get a chat with its messages"""
     try:
+        # Get authenticated user ID
+        authenticated_user_id = current_user.get("_id") or current_user.get("id")
+        if not authenticated_user_id:
+            raise HTTPException(status_code=401, detail="User ID not found in token")
+        
         chat_repo = ChatRepository()
+        chat = await chat_repo.get_chat_by_id(chat_id)
+        if not chat:
+            raise HTTPException(status_code=404, detail="Chat not found")
+        
+        check_chat_ownership(chat, str(authenticated_user_id))
+        
         result = await chat_repo.get_chat_with_messages(chat_id, page, limit)
         if not result:
             raise HTTPException(status_code=404, detail="Chat not found")
@@ -382,14 +523,21 @@ async def websocket_endpoint(websocket: WebSocket, chat_id: str):
     Adapted from the bot system to work with MongoDB chat collections.
     """
     try:
-        print(f"WebSocket connected-------------- for chat {chat_id}")
+        print(f"WebSocket connected for chat {chat_id}")
+        
+        # ✅ OPTIMIZATION: Validate chat_id once on connection (not every message)
+        chat_repo = ChatRepository()
+        chat = await chat_repo.get_chat_by_id(chat_id)
+        if not chat:
+            await handle_invalid_chat_id(websocket, chat_id)
+            return
+        
         await connect_websocket(websocket, chat_id)
         current_time = datetime.now().strftime("%H:%M")
         is_error = False
 
         while True:
             data = await websocket.receive_text()
-            print("data>>>>>>>>>vmvm,mxv,mx>>>>>2 in router>>>>>chatid>>>before process data>>>>>>>",chat_id)
             await process_received_data(data, chat_id, current_time, is_error, websocket)
 
     except WebSocketDisconnect as e:
@@ -417,19 +565,9 @@ async def process_received_data(data: str, chat_id: str, current_time: str, is_e
         timezone = received_data.get("timezone", "UTC")
         language_code = received_data.get("selectedLanguage", "en")
         
-        # Validate chat_id
-        try:
-            # Check if chat exists in MongoDB
-            chat_repo = ChatRepository()
-            chat = await chat_repo.get_chat_by_id(chat_id)
-            print("chat>>>>>>>>>vmvm,mxv,mx>>>>>2 in router>>>>>chat>>>>>>>>>>",chat)
-            if not chat:
-                await handle_invalid_chat_id(websocket, chat_id)
-                return
-        except Exception as e:
-            print(f"Error validating chat_id: {e}")
-            await handle_invalid_chat_id(websocket, chat_id)
-            return
+        # ✅ OPTIMIZATION: Cache chat validation (check once per connection, not every message)
+        # We'll validate chat_id only on connection, not on every message
+        # Chat validation moved to connection handler to reduce latency
 
         if message_type == "message_upload" and not is_error:
             # Handle message upload

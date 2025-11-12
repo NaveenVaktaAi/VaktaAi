@@ -11,9 +11,11 @@ def get_ai_tutor_collections(db: Database):
     # Conversations collection indexes
     conversations.create_index("user_id")
     conversations.create_index("status")
+    conversations.create_index("exam_type")  # Index for exam_type filtering
     conversations.create_index("created_at")
     conversations.create_index("updated_at")
     conversations.create_index([("user_id", 1), ("created_at", -1)])
+    conversations.create_index([("user_id", 1), ("exam_type", 1)])  # Compound index for exam queries
     
     return conversations
 
@@ -155,6 +157,15 @@ def search_conversations(db: Database, user_id: int, search_query: str, limit: i
         "user_id": user_id,
         "title": {"$regex": search_query, "$options": "i"}
     }).sort("created_at", -1).limit(limit))
+
+
+def get_conversations_by_exam_type(db: Database, user_id: int, exam_type: str) -> List[Dict[str, Any]]:
+    """Get all conversations for a user filtered by exam_type"""
+    conversations = get_ai_tutor_collections(db)
+    return list(conversations.find({
+        "user_id": user_id,
+        "exam_type": exam_type
+    }).sort("created_at", -1))
 
 
 def get_recent_active_conversations(db: Database, user_id: int, days: int = 7, limit: int = 10) -> List[Dict[str, Any]]:

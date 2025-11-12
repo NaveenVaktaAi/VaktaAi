@@ -1,5 +1,6 @@
 from typing import List, Dict, Any, Optional
 from datetime import datetime
+import asyncio
 from bson import ObjectId
 from app.database.session import get_db
 from app.database.mongo_collections import (
@@ -24,11 +25,15 @@ class ChatRepository:
 
     async def create_chat(self, chat_data: ChatCreate) -> str:
         """Create a new chat"""
+        # Ensure user_id is set (should be set by router from auth middleware)
+        if not chat_data.user_id:
+            raise ValueError("user_id is required and must be set from auth middleware")
+        
         chat_doc = {
             "user_id": chat_data.user_id,
             "document_id": ObjectId(chat_data.document_id) if chat_data.document_id else None,
             "training_doc_id": ObjectId(chat_data.training_doc_id) if chat_data.training_doc_id else None,
-            "title": "",
+            "title": chat_data.title,  # Use title from chat_data instead of empty string
             "status": chat_data.status,
             "created_at": datetime.now(),
             "updated_at": datetime.now()
@@ -39,7 +44,7 @@ class ChatRepository:
         """Get a chat by ID"""
         return get_chat(self.db, chat_id)
 
-    async def get_user_chats(self, user_id: int, page: int = 1, limit: int = 10) -> ChatListResponse:
+    async def get_user_chats(self, user_id: str, page: int = 1, limit: int = 10) -> ChatListResponse:
         """Get all chats for a user with pagination"""
         skip = (page - 1) * limit
         chats = get_user_chats(self.db, user_id)
@@ -53,7 +58,7 @@ class ChatRepository:
         for chat in paginated_chats:
             chat_responses.append(ChatResponse(
                 _id=str(chat["_id"]),
-                user_id=chat["user_id"],
+                user_id=str(chat["user_id"]),  # Convert to string
                 document_id=str(chat["document_id"]) if chat.get("document_id") else None,
                 title=chat["title"],
                 status=chat["status"],
@@ -95,9 +100,9 @@ class ChatRepository:
     async def create_chat_message(self, message_data: ChatMessageCreate) -> str:
         """Create a new chat message"""
         try:
-            # Check for recent duplicate before creating
+            # ✅ OPTIMIZATION: Reduced duplicate check window from 5s to 2s and simplified query
             from datetime import timedelta
-            recent_time = datetime.now() - timedelta(seconds=5)
+            recent_time = datetime.now() - timedelta(seconds=2)
             
             existing = list(self.db["chat_messages"].find({
                 "chat_id": ObjectId(message_data.chat_id),
@@ -107,9 +112,8 @@ class ChatRepository:
             }).limit(1))
             
             if existing:
-                print(f"[DEBUG] Duplicate detected in repository, returning existing: {existing[0]['_id']}")
                 return str(existing[0]["_id"])
-            print("create chat message>>>>>>>>>>>>>>>>>>>in create_chat_message chat_id=======>",message_data.chat_id)
+            
             message_doc = {
                 "chat_id": ObjectId(message_data.chat_id),
                 "message": message_data.message,
@@ -119,17 +123,17 @@ class ChatRepository:
                 "type": message_data.type,
                 "is_edited": message_data.is_edited,
                 "training_doc_id": ObjectId(message_data.training_doc_id) if message_data.training_doc_id else None,
+                "citation": message_data.citation,  # Save citation source
                 "created_ts": datetime.now(),
                 "updated_ts": datetime.now()
             }
             message_id = create_chat_message(self.db, message_doc)
-            print(f"[DEBUG] New message created in repository: {message_id}")
             
-            # Update chat title if this is the first user message
+            # ✅ OPTIMIZATION: Update chat title in background (non-blocking)
             if not message_data.is_bot:
-                await self._update_chat_title_if_first_user_message(message_data.chat_id, message_data.message)
+                # Run title update in background to not block message creation
+                asyncio.create_task(self._update_chat_title_if_first_user_message(message_data.chat_id, message_data.message))
         except Exception as e:
-            print(f"[ERROR] Error creating message: {e}")
             # If error occurs, try to find existing message
             existing = list(self.db["chat_messages"].find({
                 "chat_id": ObjectId(message_data.chat_id),
@@ -141,11 +145,10 @@ class ChatRepository:
                 return str(existing[0]["_id"])
             raise e
         
-        # Send WebSocket notification if manager is available
-        # BUT skip for bot messages since they are already streamed to frontend
+        # ✅ OPTIMIZATION: Send WebSocket notification in background (non-blocking)
         if self.websocket_manager and not message_data.is_bot:
-            print(f"[DEBUG] Sending websocket notification for user message: {message_id}")
-            await self.websocket_manager.send_to_chat(
+            # Send notification in background to not block response
+            asyncio.create_task(self.websocket_manager.send_to_chat(
                 message_data.chat_id,
                 {
                     "mt": "new_message",
@@ -155,9 +158,7 @@ class ChatRepository:
                     "isBot": message_data.is_bot,
                     "timestamp": datetime.now().isoformat(),
                 }
-            )
-        elif message_data.is_bot:
-            print(f"[DEBUG] Skipping websocket notification for bot message (already streamed): {message_id}")
+            ))
         
         return message_id
 
@@ -206,6 +207,7 @@ class ChatRepository:
             "type": message_data.type,
             "is_edited": message_data.is_edited,
             "training_doc_id": ObjectId(message_data.training_doc_id) if message_data.training_doc_id else None,
+            "citation": message_data.citation,  # Save citation source
             "created_ts": datetime.now(),
             "updated_ts": datetime.now()
         }
@@ -252,6 +254,7 @@ class ChatRepository:
                 token=message.get("token"),
                 type=message.get("type", "text"),
                 is_edited=message.get("is_edited", False),
+                citation=message.get("citation"),  # Include citation in response
                 created_ts=message.get("created_ts"),
                 updated_ts=message.get("updated_ts")
             ))
@@ -290,6 +293,7 @@ class ChatRepository:
                 token=message.get("token"),
                 type=message.get("type", "text"),
                 is_edited=message.get("is_edited", False),
+                citation=message.get("citation"),  # Include citation in response
                 created_ts=message.get("created_ts"),
                 updated_ts=message.get("updated_ts")
             ))
@@ -343,7 +347,7 @@ class ChatRepository:
         # Create chat response
         chat_response = ChatResponse(
             _id=str(chat["_id"]),
-            user_id=chat["user_id"],
+            user_id=str(chat["user_id"]),  # Convert to string
             document_id=str(chat["document_id"]) if chat.get("document_id") else None,
             title=chat["title"],
             status=chat["status"],

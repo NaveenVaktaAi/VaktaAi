@@ -22,7 +22,7 @@ class PyObjectId(ObjectId):
 # AgentAIDocument Schema
 # ----------------------------
 class DocSathiAIDocumentBase(BaseModel):
-    user_id: Optional[int]
+    user_id: Optional[str]  # Changed to str to support ObjectId strings
     name: Optional[str] = None
     url: Optional[str] = None
     status: Optional[str] = None

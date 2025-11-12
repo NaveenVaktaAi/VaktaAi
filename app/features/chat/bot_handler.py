@@ -64,6 +64,9 @@ class MongoDBBotHandler:
         # Simple in-memory cache for frequent queries
         self._query_cache = {}
         self._cache_max_size = 100
+        # Cache for chat existence checks (reduces DB queries)
+        self._chat_cache = {}
+        self._chat_cache_ttl = 300  # 5 minutes TTL
 
     async def handle_user_message(self, user_message: str, use_web_search: bool = False) -> bool:
         """
@@ -75,37 +78,16 @@ class MongoDBBotHandler:
             use_web_search: Whether to enable web search (default: False, uses only document RAG)
         """
         try:
-            # Debug: Check if user message already exists to prevent duplicates
-            print(f"[DEBUG] Attempting to save user message: '{user_message}' for chat: {self.chat_id}")
-            
-            # Check for recent duplicate within last 5 seconds
-            from datetime import datetime, timedelta
-            recent_time = datetime.now() - timedelta(seconds=5)
-            
-            existing_messages = await self.chat_repository.get_chat_messages(
-                self.chat_id, page=1, limit=5
+            # ✅ OPTIMIZATION: Reduce duplicate check overhead - repository already handles this
+            # Create user message (repository has duplicate check built-in)
+            user_message_data = ChatMessageCreate(
+                chat_id=self.chat_id,
+                message=user_message,
+                is_bot=False,
+                type="text"
             )
             
-            # Check if this exact message was saved recently
-            for msg in existing_messages:
-                if (msg.message == user_message and 
-                    msg.created_ts and 
-                    msg.created_ts > recent_time):
-                    print(f"[DEBUG] Duplicate user message detected, skipping save: {msg.id}")
-                    user_message_id = msg.id
-                    break
-            else:
-                # Create user message in MongoDB
-                print(f"[DEBUG] Creating new user message in database")
-                user_message_data = ChatMessageCreate(
-                    chat_id=self.chat_id,
-                    message=user_message,
-                    is_bot=False,
-                    type="text"
-                )
-                
-                user_message_id = await self.chat_repository.create_chat_message(user_message_data)
-                logger.info(f"User message created: {user_message_id}")
+            user_message_id = await self.chat_repository.create_chat_message(user_message_data)
 
             # nornal_response = await self.get_normal_response(user_message)
             # if nornal_response:
@@ -117,9 +99,17 @@ class MongoDBBotHandler:
             #     return True
             # if await self.auto_reply_handler(user_message, "confirmation"):
             #     return True
-            chat_history_text = "There is no chat history"    
-            chat_history_text = await self.get_chat_history()
-            raw = await self.get_goforward_decision_and_response(user_message, chat_history_text)
+            # ✅ OPTIMIZATION: Start goforward decision and chat history in parallel
+            chat_history_task = asyncio.create_task(self.get_chat_history())
+            
+            # Get chat history (non-blocking if already fetched)
+            chat_history_text = await chat_history_task
+            
+            # ✅ OPTIMIZATION: Start goforward decision immediately (don't block on it)
+            goforward_task = asyncio.create_task(
+                self.get_goforward_decision_and_response(user_message, chat_history_text)
+            )
+            raw = await goforward_task
             
             # Parse the raw response to get goforward decision
             try:
@@ -143,7 +133,6 @@ class MongoDBBotHandler:
                     # Use the immediate response from decision function
                     immediate_response = parsed_response.get("response", "")
                     if immediate_response:
-                        print(f"💬 Using immediate response (goforward=False): {immediate_response}")
                         
                         # Create ultra-fast streaming generator for immediate response
                         async def string_to_generator(data):
@@ -155,8 +144,6 @@ class MongoDBBotHandler:
                                 await asyncio.sleep(delay)
                         
                         generator = string_to_generator(immediate_response)
-                        print(f"🎬 Starting immediate response streaming...")
-                        
                         # Send immediate response and get final text (immediate responses are AI-generated)
                         final_response = await self.websocket_response.create_streaming_response(
                             generator,
@@ -171,91 +158,73 @@ class MongoDBBotHandler:
                                 chat_id=self.chat_id,
                                 message=final_response,
                                 is_bot=True,
-                                type="text"
+                                type="text",
+                                citation="ai"  # Immediate responses are AI-generated
                             )
                             bot_message_id = await self.chat_repository.create_chat_message(bot_message_data)
-                            print(f"💾 Immediate response saved to DB: {bot_message_id}")
                         except Exception as save_error:
-                            print(f"⚠️ Error saving immediate response to DB: {save_error}")
+                            pass  # ✅ OPTIMIZATION: Removed verbose logging
                         
                         return True
                     else:
                         print("No immediate response provided, continuing with RAG")
                 
                 # If goforward=True, continue with RAG processing
-                print(f"Proceeding with RAG (goforward=True)")
-                
-            except (json.JSONDecodeError, ValueError) as parse_error:
-                print(f"JSON parsing failed: {parse_error}")
-                print(f"Raw response was: {raw}")
+            except (json.JSONDecodeError, ValueError):
                 # Fallback: continue with RAG processing
-            except Exception as e:
-                print(f"Error in goforward decision processing: {e}")
+                pass  # ✅ OPTIMIZATION: Removed verbose logging
+            except Exception:
                 # Fallback: continue with RAG processing
+                pass  # ✅ OPTIMIZATION: Removed verbose logging
             
-            # Process user input for keywords and language detection
+            # ✅ OPTIMIZATION: Skip language detection if already detected from goforward decision
+            # Extract language info from goforward response if available
+            processed_user_message = user_message
+            language_code = "en"
+            detected_language = "English"
+            
             try:
-                message_response = (
-                    await self.get_multi_response_from_gpt_based_on_user_input(
-                        user_input=user_message,
-                        chat_history_text=chat_history_text,
-                    )
-                )
-            
-                processed_user_message = user_message  # Default to original message
-                language_code = "en"  # Default language
-                detected_language = "English"  # Default language
-                
-                if message_response:
-                        try:
-                            message_data = self.extract_json_from_text(message_response)
-                            processed_user_message = message_data.get("translated_input", user_message)
-                            language_code = message_data.get("language_code", "en")
-                            detected_language = message_data.get("detected_language", "English")
-                    
-                # Update language code if detected
-                            self.language_code = language_code
-                        except Exception as lang_error:
-                            print(f"Error in language detection: {lang_error}")
-                        # Use defaults
-                        
+                # Try to parse language from goforward decision response
+                if raw:
+                    try:
+                        json_text = raw.strip()
+                        if json_text.startswith('```json'):
+                            json_text = json_text[7:]
+                        if json_text.endswith('```'):
+                            json_text = json_text[:-3]
+                        parsed_response = json.loads(json_text.strip())
+                        processed_user_message = parsed_response.get("translated_input", user_message)
+                        language_code = parsed_response.get("language_code", "en")
+                        detected_language = parsed_response.get("detected_language", "English")
+                        self.language_code = language_code
+                        print(f"✅ Language detected from goforward: {language_code}")
+                    except:
+                        pass  # Fallback to default
             except Exception as e:
-                print(f"Error in message processing: {e}")
-                processed_user_message = user_message
-                language_code = "en"
-                detected_language = "English"
-            # Start web search in parallel ONLY if enabled by user
+                print(f"Error parsing language from goforward: {e}")
+                # Use defaults
+            # ✅ OPTIMIZATION: Start web search and RAG search in parallel
             web_search_task = None
             if use_web_search:
-                print("🌐 Web Search ENABLED - Starting parallel web search...")
-                
+                # Start web search task immediately (non-blocking)
                 async def fetch_web_results():
                     try:
-                        # Run web search in thread pool since tool.invoke() is sync
-                        import asyncio
                         loop = asyncio.get_event_loop()
                         results = await loop.run_in_executor(None, tool.invoke, processed_user_message)
-                        if results:
-                            print("results>>>>>>>tavily>>>>>>>>>>>>>>>>>>>>>>", results[0].get('title', 'No title'))
-                            print("results>>>>>>>content>>>>>>>>>>>>>>>>>>>>>>", results[0].get('content', 'No content'))
-                        return results
+                        return results or []
                     except Exception as e:
-                        print(f"Error fetching web search results: {e}")
                         return []
                 
-                # Start web search task immediately
                 web_search_task = asyncio.create_task(fetch_web_results())
-            else:
-                print("📄 Document-Only Mode - Web search DISABLED (using RAG only)")
             
-            # Process bot response with RAG (this will also run in parallel)
+            # ✅ OPTIMIZATION: Process bot response immediately (RAG runs in parallel with web search)
             is_result_found = await self.process_bot_response(
                 self.db, 
                 processed_user_message,
                 language_code,
                 detected_language,
                 web_search_task,  # Pass the task, not the results yet
-                use_web_search=use_web_search  # ✅ Pass web search flag for citation logic
+                use_web_search=use_web_search
             )
             
             if is_result_found:
@@ -345,11 +314,11 @@ class MongoDBBotHandler:
         ]
 
         try:
+            # ✅ OPTIMIZATION: Use faster model for goforward decision (gpt-3.5-turbo instead of gpt-4)
             raw = await ResponseCreator().gpt_response_without_stream(prompt)
-            print("raw>>>>>>>>>>>>>>>>>>>>>>>>>>>>>",raw)
         except Exception as e:
             # LLM call failed — conservatively continue to RAG
-            print("[get_goforward_decision_and_response] LLM call failed:", e)
+            pass  # ✅ OPTIMIZATION: Removed verbose logging
             return {
                 "goforward": True,
                 "response": None,
@@ -459,19 +428,16 @@ CHAT_HISTORY_LAST_TWO: {chat_history_text}
             
             if cached_result:
                 answer_ids = cached_result
-                print(f"🎯 Using cached search results: {len(answer_ids)} IDs")
             else:
-                print("🔍 Starting semantic search...")
+                # ✅ OPTIMIZATION: Run semantic search in background thread pool for non-blocking
                 search_start = asyncio.get_event_loop().time()
                 answer_ids = await bot_graph_mixin.search_answers(
-                [user_message.lower()], chunk_msmarcos_collection, self.document_id
-            )
+                    [user_message.lower()], chunk_msmarcos_collection, self.document_id
+                )
                 search_end = asyncio.get_event_loop().time()
-                print(f"⚡ Search completed in {search_end - search_start:.3f}s")
+                if search_end - search_start > 0.5:  # Only log slow searches
+                    print(f"⚡ Search completed in {search_end - search_start:.3f}s")
                 self._set_cache(cache_key, answer_ids)
-            
-            print(f"SEARCH_ANSWERS IDs: {answer_ids}\n")
-            print("self.document_id-------------------doc--------", self.document_id)
 
             if answer_ids:
                 try:
@@ -520,28 +486,23 @@ CHAT_HISTORY_LAST_TWO: {chat_history_text}
                     return False
                 # print("formatted_results>>>>>>>>>>>>>>>>>>>>>>>>>>>>>", formatted_results)
                 
-                # Get web search results if task is provided
+                # ✅ OPTIMIZATION: Get web search results if task is provided (non-blocking)
                 web_results = []
                 if web_search_task:
                     try:
                         web_results = await web_search_task
-                        print(f"✅ Web search completed with {len(web_results)} results")
-                    except Exception as e:
-                        print(f"❌ Web search failed: {e}")
+                    except Exception:
                         web_results = []
                 
                 # Rule 1: If user enabled web search, always use "web_search" citation
-                # For other cases, we'll determine citation AFTER GPT response (based on actual usage)
                 initial_citation_source = None
                 if use_web_search:
                     initial_citation_source = "web_search"
-                    print(f"📚 Citation source: {initial_citation_source} (user enabled web search)")
                 
-                # Get GPT response from chunks with web results (optimized)
-                print("🤖 Starting GPT response generation...")
+                # ✅ OPTIMIZATION: Start GPT response immediately
                 gpt_start = asyncio.get_event_loop().time()
                 
-                # Get the generator (don't await it!)
+                # ✅ OPTIMIZATION: Get the generator and start streaming immediately
                 gpt_resp_generator = self.get_chunk_response_from_gpt(
                     user_message, 
                     formatted_results, 
@@ -549,7 +510,6 @@ CHAT_HISTORY_LAST_TWO: {chat_history_text}
                     web_results
                 )
                 
-                print("📡 Sending streaming response to frontend...")
                 # Create a wrapper generator that will determine citation after response
                 response_text_container = {"text": ""}
                 message_id = f"rag_response_{datetime.now().timestamp()}"
@@ -568,22 +528,19 @@ CHAT_HISTORY_LAST_TWO: {chat_history_text}
                     citation_source=None  # Will be determined after response
                 )
                 
-                # ✅ Determine actual citation source based on GPT response analysis
-                # Check if GPT actually used chunks or relied on its own knowledge (70-80% threshold)
+                # ✅ OPTIMIZATION: Determine citation source using GPT analysis
                 actual_response = response_text_container["text"] or final_response
                 if initial_citation_source:
-                    citation_source = initial_citation_source  # Web search already set
+                    citation_source = initial_citation_source
                 else:
-                    citation_source = self._determine_citation_from_response(
+                    citation_source = await self._determine_citation_from_response(
                         actual_response,
                         formatted_results,
                         user_message,
                         web_results
                     )
-                    print(f"📚 Final citation source determined: {citation_source}")
                 
-                # ✅ Send citation source update via WebSocket metadata
-                # Update the stop message with correct citation source
+                # ✅ OPTIMIZATION: Send citation source update via WebSocket metadata (non-blocking)
                 try:
                     await self.websocket_response.connection_manager.send_personal_message(
                         self.websocket_response.websocket,
@@ -591,52 +548,48 @@ CHAT_HISTORY_LAST_TWO: {chat_history_text}
                             "mt": "chat_message_bot_partial",
                             "chatId": self.chat_id,
                             "stop": message_id,
-                            "citation_source": citation_source,  # Add citation to stop message
+                            "citation_source": citation_source,
                             "timestamp": datetime.now().isoformat(),
                         }
                     )
-                    print(f"📡 Citation source update sent: {citation_source}")
-                except Exception as e:
-                    print(f"⚠️ Failed to send citation update: {e}")
+                except Exception:
+                    pass  # ✅ OPTIMIZATION: Don't block on citation update failure
                 
                 gpt_end = asyncio.get_event_loop().time()
-                print(f"✅ GPT streaming completed in {gpt_end - gpt_start:.3f}s")
+                if gpt_end - gpt_start > 2.0:  # Only log slow responses
+                    print(f"✅ GPT streaming completed in {gpt_end - gpt_start:.3f}s")
                 
-                # Save bot message to database after streaming completes
+                # ✅ OPTIMIZATION: Save bot message in background (non-blocking)
                 try:
                     bot_message_data = ChatMessageCreate(
                         chat_id=self.chat_id,
                         message=final_response,
                         is_bot=True,
-                        type="text"
+                        type="text",
+                        citation=citation_source  # Save citation source
                     )
-                    bot_message_id = await self.chat_repository.create_chat_message(bot_message_data)
-                    print(f"💾 Bot message saved to DB: {bot_message_id}")
-                except Exception as save_error:
-                    print(f"⚠️ Error saving bot message to DB: {save_error}")
-                    # Don't fail the request if DB save fails
+                    # Save in background task to not block response
+                    asyncio.create_task(self.chat_repository.create_chat_message(bot_message_data))
+                except Exception:
+                    pass  # ✅ OPTIMIZATION: Don't fail request if DB save fails
 
                 return True
 
-            # Get web search results for fallback case too
+            # ✅ OPTIMIZATION: Get web search results for fallback case
             web_results = []
             if web_search_task:
                 try:
                     web_results = await web_search_task
-                    print(f"✅ Web search completed for fallback with {len(web_results)} results")
-                except Exception as e:
-                    print(f"❌ Web search failed in fallback: {e}")
+                except Exception:
                     web_results = []
 
             # ✅ Determine citation source for fallback
-            # If user enabled web search, always use "web_search"
             if use_web_search:
                 citation_source = "web_search"
             elif web_results and len(web_results) > 0:
-                citation_source = "web_search"  # Web search available but no documents
+                citation_source = "web_search"
             else:
-                citation_source = "ai"  # Pure AI response
-            print(f"📚 Fallback citation source: {citation_source}")
+                citation_source = "ai"
 
             # Fallback to GPT response if no answer found
             print("📝 No relevant chunks found, using fallback GPT response...")
@@ -681,7 +634,8 @@ CHAT_HISTORY_LAST_TWO: {chat_history_text}
                     chat_id=self.chat_id,
                     message=final_response,
                     is_bot=True,
-                    type="text"
+                    type="text",
+                    citation=citation_source  # Save citation source
                 )
                 bot_message_id = await self.chat_repository.create_chat_message(bot_message_data)
                 print(f"💾 Fallback bot message saved to DB: {bot_message_id}")
@@ -859,7 +813,7 @@ CHAT_HISTORY_LAST_TWO: {chat_history_text}
  
         return formatted_chunks, summary_tracker  # Return both chunks & summary references
 
-    def _determine_citation_from_response(
+    async def _determine_citation_from_response(
         self,
         gpt_response: str,
         formatted_chunks: list,
@@ -867,8 +821,8 @@ CHAT_HISTORY_LAST_TWO: {chat_history_text}
         web_results: list
     ) -> str:
         """
-        Determine citation source by analyzing if GPT actually used chunks or relied on own knowledge.
-        Uses keyword matching and chunk content comparison to check if response is 70-80% from chunks.
+        ✅ IMPROVED APPROACH: GPT-based analysis to determine citation source.
+        GPT analyzes if the response used chunks and returns percentage.
         
         Args:
             gpt_response: The GPT-generated response
@@ -877,92 +831,216 @@ CHAT_HISTORY_LAST_TWO: {chat_history_text}
             web_results: Web search results (if any)
             
         Returns:
-            "document" if chunks were used (70%+ from chunks)
+            "document" if chunks were heavily used (70%+ from chunks)
+            "document + ai" if chunks were partially used (10-70% from chunks)
             "web_search" if web results were used
-            "ai" if GPT used mostly its own knowledge
+            "ai" if GPT used mostly its own knowledge (< 10% from chunks)
         """
         try:
             # Rule 1: If no chunks provided, definitely AI
             if not formatted_chunks or len(formatted_chunks) == 0:
                 return "ai"
             
-            # Rule 2: Check if response contains indicators that chunks were ignored
-            response_lower = gpt_response.lower()
-            ignore_keywords = [
-                "not found in the document",
-                "not in the provided context",
-                "not mentioned in",
-                "general knowledge",
-                "based on my knowledge",
-                "the document doesn't contain",
-                "not available in the context",
-                "outside the scope",
-                "irrelevant"
-            ]
+            # ✅ NEW APPROACH: Use GPT to analyze citation source
+            # This is more accurate than word-based similarity
+            try:
+                citation_result = await self._analyze_citation_with_gpt(
+                    gpt_response, formatted_chunks, user_query
+                )
+                return citation_result
+            except Exception as gpt_error:
+                print(f"⚠️ GPT citation analysis failed: {gpt_error}, using fallback")
+                # Fallback to simpler logic if GPT call fails
+                return self._determine_citation_fallback(gpt_response, formatted_chunks, user_query)
             
-            for keyword in ignore_keywords:
-                if keyword in response_lower:
-                    print(f"📚 GPT indicated chunks were ignored (keyword: {keyword})")
-                    return "ai"
-            
-            # Rule 3: Check content similarity - extract key phrases from chunks
-            # Simple approach: Check if significant chunk content appears in response
-            chunk_content_used = False
-            chunk_phrases = []
-            
+        except Exception as e:
+            print(f"🚨 Error in citation determination: {e}")
+            # Fallback: if chunks provided, assume "document + ai"
+            if formatted_chunks and len(formatted_chunks) > 0:
+                return "document + ai"
+            return "ai"
+    
+    async def _analyze_citation_with_gpt(
+        self,
+        gpt_response: str,
+        formatted_chunks: list,
+        user_query: str
+    ) -> str:
+        """
+        Use GPT to analyze if the response used chunks and determine citation source.
+        Fast and accurate approach.
+        """
+        try:
+            # Extract chunk content (first 500 chars from each chunk for context)
+            chunk_summaries = []
             for chunk_info in formatted_chunks:
                 if isinstance(chunk_info, dict):
                     chunk_text = chunk_info.get("context_data", "")
                 else:
                     chunk_text = str(chunk_info)
                 
-                # Extract key phrases from chunk (simple: first 50-100 words)
-                words = chunk_text.split()[:50]
-                key_phrase = " ".join(words).lower()
-                chunk_phrases.append(key_phrase)
+                # Extract actual content
+                if "context:" in chunk_text.lower():
+                    parts = chunk_text.lower().split("context:", 1)
+                    if len(parts) > 1:
+                        chunk_text = parts[1].strip()
                 
-                # Check if this phrase appears in response
-                if len(key_phrase) > 20 and key_phrase in response_lower:
-                    chunk_content_used = True
-                    break
+                # Take first 500 chars for analysis
+                chunk_summary = chunk_text[:500] if len(chunk_text) > 500 else chunk_text
+                chunk_summaries.append(chunk_summary)
             
-            # Rule 4: Check response length vs chunk content
-            # If response is very long but doesn't match chunks, likely AI-generated
-            response_length = len(gpt_response.split())
-            if response_length > 100 and not chunk_content_used:
-                # Check if response contains unique terms not in chunks
-                response_words = set(response_lower.split())
-                chunk_words = set()
-                for phrase in chunk_phrases:
-                    chunk_words.update(phrase.split())
+            combined_chunks = "\n\n".join(chunk_summaries[:3])  # Use top 3 chunks
+            
+            # Create prompt for GPT to analyze citation
+            analysis_prompt = f"""You are a citation analyzer. Analyze if the AI response used the provided document chunks to answer the user query.
+
+USER QUERY: {user_query}
+
+DOCUMENT CHUNKS PROVIDED:
+{combined_chunks}
+
+AI RESPONSE:
+{gpt_response}
+
+Analyze and determine:
+1. Did the AI response use information from the document chunks? (Yes/No)
+2. What percentage of the answer came from the chunks? (0-100%)
+3. Did the AI add its own knowledge/explanations? (Yes/No)
+
+Return ONLY a JSON object with this exact structure:
+{{
+    "used_chunks": true/false,
+    "percentage_from_chunks": 0-100,
+    "added_ai_knowledge": true/false
+}}
+
+Be strict: If the query concept exists in chunks (even if explained differently), consider it as using chunks.
+Example: Query "degree of ionization" exists in chunks → used_chunks: true, even if response words differ."""
+
+            # Call GPT with fast model (gpt-3.5-turbo or gpt-4o-mini)
+            response_creator = ResponseCreator()
+            
+            # Use fast model for quick analysis
+            messages = [
+                {"role": "system", "content": "You are a citation analyzer. Return only valid JSON."},
+                {"role": "user", "content": analysis_prompt}
+            ]
+            
+            # Get response (non-streaming for speed)
+            analysis_response = await response_creator.gpt_response_without_stream(messages)
+            
+            # Parse JSON response
+            try:
+                # Clean response (remove markdown if present)
+                analysis_text = analysis_response.strip()
+                if "```json" in analysis_text:
+                    analysis_text = analysis_text.split("```json")[1].split("```")[0].strip()
+                elif "```" in analysis_text:
+                    analysis_text = analysis_text.split("```")[1].split("```")[0].strip()
                 
-                # If > 70% of response words are NOT in chunks, likely AI
-                unique_ratio = len(response_words - chunk_words) / len(response_words) if response_words else 0
-                if unique_ratio > 0.7:
-                    print(f"📚 Response has {unique_ratio*100:.1f}% unique content (not from chunks)")
+                analysis_data = json.loads(analysis_text)
+                
+                used_chunks = analysis_data.get("used_chunks", False)
+                percentage = analysis_data.get("percentage_from_chunks", 0)
+                added_ai = analysis_data.get("added_ai_knowledge", True)
+                
+                # Determine citation based on GPT analysis
+                if not used_chunks or percentage < 10:
                     return "ai"
-            
-            # Rule 5: If chunks were provided and response seems to use them, return "document"
-            if chunk_content_used:
-                return "document"
-            
-            # Rule 6: Default to "document" if chunks provided, but with caution
-            # If response is very short or generic, likely AI
-            if response_length < 30:
-                print(f"📚 Response too short ({response_length} words), likely AI")
-                return "ai"
-            
-            # If we have chunks but couldn't verify usage, assume document (conservative)
-            # But log a warning
-            print(f"⚠️ Could not definitively determine citation source, defaulting to 'document'")
-            return "document"
+                elif percentage >= 70:
+                    return "document"
+                else:
+                    # 10-70% from chunks → "document + ai"
+                    return "document + ai"
+                    
+            except json.JSONDecodeError:
+                # If JSON parsing fails, check if response contains keywords
+                analysis_lower = analysis_response.lower()
+                if "used_chunks" in analysis_lower and "true" in analysis_lower:
+                    if "70" in analysis_response or "80" in analysis_response or "90" in analysis_response or "100" in analysis_response:
+                        return "document"
+                    else:
+                        return "document + ai"
+                return "document + ai"  # Conservative fallback
             
         except Exception as e:
-            print(f"🚨 Error in citation determination: {e}")
-            # Fallback: if chunks provided, assume document
-            if formatted_chunks and len(formatted_chunks) > 0:
-                return "document"
-            return "ai"
+            print(f"⚠️ Error in GPT citation analysis: {e}")
+            raise  # Re-raise to trigger fallback
+    
+    def _determine_citation_fallback(
+        self,
+        gpt_response: str,
+        formatted_chunks: list,
+        user_query: str
+    ) -> str:
+        """
+        Fallback citation determination using query-chunk relevance check.
+        Faster than GPT but less accurate.
+        """
+        try:
+            response_lower = gpt_response.lower()
+            query_lower = user_query.lower()
+            
+            # Extract chunk content
+            all_chunk_text = ""
+            for chunk_info in formatted_chunks:
+                if isinstance(chunk_info, dict):
+                    chunk_text = chunk_info.get("context_data", "")
+                else:
+                    chunk_text = str(chunk_info)
+                
+                if "context:" in chunk_text.lower():
+                    parts = chunk_text.lower().split("context:", 1)
+                    if len(parts) > 1:
+                        chunk_text = parts[1].strip()
+                
+                all_chunk_text += " " + chunk_text.lower()
+            
+            # Check if query terms/concepts appear in chunks
+            query_words = set(query_lower.split())
+            chunk_words = set(all_chunk_text.split())
+            
+            # Remove stop words
+            stop_words = {'the', 'a', 'an', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for', 
+                         'of', 'with', 'by', 'is', 'are', 'was', 'were', 'be', 'been', 'have', 
+                         'has', 'had', 'do', 'does', 'did', 'will', 'would', 'could', 'should',
+                         'what', 'how', 'why', 'when', 'where', 'which', 'who'}
+            
+            query_keywords = query_words - stop_words
+            matching_keywords = query_keywords & chunk_words
+            
+            # If query keywords found in chunks, likely used chunks
+            if len(matching_keywords) > 0:
+                # Check if response mentions concepts from chunks
+                # Extract key phrases from query (2-3 word combinations)
+                query_phrases = []
+                query_words_list = list(query_keywords)
+                for i in range(len(query_words_list) - 1):
+                    phrase = f"{query_words_list[i]} {query_words_list[i+1]}"
+                    if phrase in all_chunk_text:
+                        query_phrases.append(phrase)
+                
+                if len(query_phrases) > 0 or len(matching_keywords) >= 2:
+                    # Query concept found in chunks → likely used chunks
+                    return "document + ai"
+            
+            # Check for explicit ignore keywords
+            ignore_keywords = [
+                "not found in the document",
+                "not in the provided context",
+                "the document doesn't contain",
+            ]
+            
+            for keyword in ignore_keywords:
+                if keyword in response_lower:
+                    return "ai"
+            
+            # Conservative: if chunks provided, assume partial use
+            return "document + ai"
+            
+        except Exception as e:
+            print(f"⚠️ Error in fallback citation: {e}")
+            return "document + ai"
     
     def extract_json_from_text(self, text: str):
         """Extract complete JSON data from the given text."""

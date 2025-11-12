@@ -241,8 +241,10 @@ class ChatWebSocketResponse:
                     token_count += 1
                     final_text += word
                     await self.send_message_partial(message_id, word)
-                    # Small delay for smooth streaming (adjust as needed)
-                    await asyncio.sleep(0.01)  # Reduced from 0.05 for faster streaming
+                    # ✅ OPTIMIZATION: Remove delay for faster streaming - network buffers naturally
+                    # Only add minimal delay for very long messages to prevent overwhelming the client
+                    if token_count % 50 == 0:  # Check every 50 tokens instead of every token
+                        await asyncio.sleep(0.001)  # Minimal delay only every 50 tokens
 
             print(f"✅ Streaming completed: {token_count} tokens, {len(final_text)} chars")
 

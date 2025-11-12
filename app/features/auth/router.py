@@ -73,6 +73,10 @@ async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(s
                 headers={"WWW-Authenticate": "Bearer"},
             )
         
+        # Convert ObjectId to string for _id field
+        if "_id" in user and isinstance(user["_id"], ObjectId):
+            user["_id"] = str(user["_id"])
+        
         return user
         
     except HTTPException:

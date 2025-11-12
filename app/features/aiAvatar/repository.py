@@ -43,16 +43,26 @@ class AITutorRepository:
     
     async def create_conversation(self, conversation_data: ConversationCreate, user_id: int) -> str:
         """Create a new conversation"""
+        # Ensure tags is always a list, never None
+        tags_list = conversation_data.tags if conversation_data.tags is not None else []
+        
+        # Set exam_name from exam_type if not provided
+        exam_name = conversation_data.exam_name or conversation_data.exam_type
+        
         conversation_doc = {
             "user_id": user_id,
             "title": conversation_data.title or "",
             "status": conversation_data.status,
+            "exam_type": conversation_data.exam_type,
+            "exam_name": exam_name,
             "subject": conversation_data.subject,
-            "tags": conversation_data.tags or [],
+            "topic": conversation_data.topic,
+            "tags": tags_list,  # Always a list, never None
             "messages": conversation_data.messages or [],
             "created_at": datetime.utcnow(),
             "updated_at": datetime.utcnow()
         }
+        print(f"[REPOSITORY] Creating conversation with tags: {tags_list}, exam_name: {exam_name}")
         return create_conversation(self.db, conversation_doc)
     
     async def get_conversation_by_id(self, conversation_id: str) -> Optional[Dict[str, Any]]:
@@ -77,9 +87,16 @@ class AITutorRepository:
                 user_id=conv["user_id"],
                 title=conv["title"],
                 status=conv["status"],
+                exam_type=conv.get("exam_type"),
+                exam_name=conv.get("exam_name"),
                 subject=conv.get("subject"),
-                tags=conv.get("tags"),
+                topic=conv.get("topic"),
+                tags=conv.get("tags", []),  # Default to empty list if not present
                 messages=conv.get("messages", []),
+                explain_concept=conv.get("explain_concept"),
+                practice_problem=conv.get("practice_problem"),
+                study_guide=conv.get("study_guide"),
+                key_points=conv.get("key_points"),
                 created_at=conv["created_at"],
                 updated_at=conv["updated_at"]
             ))
@@ -99,10 +116,20 @@ class AITutorRepository:
             update_fields["title"] = conversation_data.title
         if conversation_data.status is not None:
             update_fields["status"] = conversation_data.status
+        if conversation_data.exam_type is not None:
+            update_fields["exam_type"] = conversation_data.exam_type
+        if conversation_data.exam_name is not None:
+            update_fields["exam_name"] = conversation_data.exam_name
+        elif conversation_data.exam_type is not None:
+            # Auto-set exam_name from exam_type if exam_name not provided
+            update_fields["exam_name"] = conversation_data.exam_type
         if conversation_data.subject is not None:
             update_fields["subject"] = conversation_data.subject
+        if conversation_data.topic is not None:
+            update_fields["topic"] = conversation_data.topic
         if conversation_data.tags is not None:
-            update_fields["tags"] = conversation_data.tags
+            # Ensure tags is always a list
+            update_fields["tags"] = conversation_data.tags if isinstance(conversation_data.tags, list) else []
         if conversation_data.messages is not None:
             update_fields["messages"] = conversation_data.messages
         
@@ -137,9 +164,16 @@ class AITutorRepository:
                 user_id=conv["user_id"],
                 title=conv["title"],
                 status=conv["status"],
+                exam_type=conv.get("exam_type"),
+                exam_name=conv.get("exam_name"),
                 subject=conv.get("subject"),
-                tags=conv.get("tags"),
+                topic=conv.get("topic"),
+                tags=conv.get("tags", []),  # Default to empty list if not present
                 messages=conv.get("messages", []),
+                explain_concept=conv.get("explain_concept"),
+                practice_problem=conv.get("practice_problem"),
+                study_guide=conv.get("study_guide"),
+                key_points=conv.get("key_points"),
                 created_at=conv["created_at"],
                 updated_at=conv["updated_at"]
             ))
@@ -162,9 +196,16 @@ class AITutorRepository:
                 user_id=conv["user_id"],
                 title=conv["title"],
                 status=conv["status"],
+                exam_type=conv.get("exam_type"),
+                exam_name=conv.get("exam_name"),
                 subject=conv.get("subject"),
-                tags=conv.get("tags"),
+                topic=conv.get("topic"),
+                tags=conv.get("tags", []),  # Default to empty list if not present
                 messages=conv.get("messages", []),
+                explain_concept=conv.get("explain_concept"),
+                practice_problem=conv.get("practice_problem"),
+                study_guide=conv.get("study_guide"),
+                key_points=conv.get("key_points"),
                 created_at=conv["created_at"],
                 updated_at=conv["updated_at"]
             ))
@@ -258,9 +299,16 @@ class AITutorRepository:
             user_id=conv["user_id"],
             title=conv["title"],
             status=conv["status"],
+            exam_type=conv.get("exam_type"),
+            exam_name=conv.get("exam_name"),
             subject=conv.get("subject"),
-            tags=conv.get("tags"),
+            topic=conv.get("topic"),
+            tags=conv.get("tags", []),  # Default to empty list if not present
             messages=messages,
+            explain_concept=conv.get("explain_concept"),
+            practice_problem=conv.get("practice_problem"),
+            study_guide=conv.get("study_guide"),
+            key_points=conv.get("key_points"),
             created_at=conv["created_at"],
             updated_at=conv["updated_at"]
         )
@@ -275,6 +323,42 @@ class AITutorRepository:
         return get_conversation_message_count(self.db, conversation_id)
     
     # ===== STATISTICS =====
+    
+    async def get_conversations_by_exam_type_grouped_by_subject(self, user_id: int, exam_type: str) -> Dict[str, List[ConversationResponse]]:
+        """Get conversations by exam_type grouped by subject"""
+        from app.database.ai_tutor_collections import get_conversations_by_exam_type
+        
+        conversations = get_conversations_by_exam_type(self.db, user_id, exam_type)
+        
+        # Group conversations by subject
+        grouped: Dict[str, List[ConversationResponse]] = {}
+        
+        for conv in conversations:
+            subject = conv.get("subject") or "Other"
+            
+            if subject not in grouped:
+                grouped[subject] = []
+            
+            grouped[subject].append(ConversationResponse(
+                _id=str(conv["_id"]),
+                user_id=conv["user_id"],
+                title=conv["title"],
+                status=conv["status"],
+                exam_type=conv.get("exam_type"),
+                exam_name=conv.get("exam_name"),
+                subject=conv.get("subject"),
+                topic=conv.get("topic"),
+                tags=conv.get("tags", []),
+                messages=conv.get("messages", []),
+                explain_concept=conv.get("explain_concept"),
+                practice_problem=conv.get("practice_problem"),
+                study_guide=conv.get("study_guide"),
+                key_points=conv.get("key_points"),
+                created_at=conv["created_at"],
+                updated_at=conv["updated_at"]
+            ))
+        
+        return grouped
     
     async def get_conversation_stats(self, user_id: int) -> ConversationStatsResponse:
         """Get conversation statistics for a user"""

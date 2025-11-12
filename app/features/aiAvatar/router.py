@@ -1,6 +1,5 @@
-from ast import Dict
+from typing import List, Optional, Dict
 from fastapi import APIRouter, HTTPException, Query, Path, WebSocket, WebSocketDisconnect, Depends, UploadFile, File, Form
-from typing import List, Optional
 import logging
 import json
 from datetime import datetime
@@ -200,9 +199,16 @@ async def get_conversation(conversation_id: str = Path(..., description="Convers
             user_id=conversation["user_id"],
             title=conversation["title"],
             status=conversation["status"],
+            exam_type=conversation.get("exam_type"),
+            exam_name=conversation.get("exam_name"),
             subject=conversation.get("subject"),
-            tags=conversation.get("tags"),
+            topic=conversation.get("topic"),
+            tags=conversation.get("tags", []),
             messages=conversation.get("messages", []),
+            explain_concept=conversation.get("explain_concept"),
+            practice_problem=conversation.get("practice_problem"),
+            study_guide=conversation.get("study_guide"),
+            key_points=conversation.get("key_points"),
             created_at=conversation["created_at"],
             updated_at=conversation["updated_at"]
         )
@@ -324,6 +330,24 @@ async def get_user_conversation_stats(user_id: int = Path(..., description="User
         raise HTTPException(status_code=500, detail=f"Error fetching stats: {str(e)}")
 
 
+# ===== EXAM-TYPE CONVERSATIONS ENDPOINT =====
+
+@router.get("/conversations/exam/{user_id}/{exam_type}", response_model=Dict[str, List[ConversationResponse]])
+async def get_exam_conversations_grouped_by_subject(
+    user_id: int = Path(..., description="User ID"),
+    exam_type: str = Path(..., description="Exam type (IIT JEE, NEET, etc.)")
+):
+    """Get conversations by exam_type grouped by subject"""
+    try:
+        repo = AITutorRepository()
+        grouped_conversations = await repo.get_conversations_by_exam_type_grouped_by_subject(user_id, exam_type)
+        return grouped_conversations
+    
+    except Exception as e:
+        logger.error(f"Error fetching exam conversations: {e}")
+        raise HTTPException(status_code=500, detail=f"Error fetching exam conversations: {str(e)}")
+
+
 # ===== SEARCH ENDPOINT =====
 
 @router.get("/conversations/search/{user_id}", response_model=List[ConversationResponse])
@@ -341,6 +365,586 @@ async def search_conversations(
     except Exception as e:
         logger.error(f"Error searching conversations: {e}")
         raise HTTPException(status_code=500, detail=f"Error searching conversations: {str(e)}")
+
+
+# ===== QUICK ACTION ENDPOINTS =====
+# Practice Problem, Study Guide, Key Points
+
+@router.post("/practice-problem")
+async def practice_problem(
+    conversation_id: str = Form(..., description="Conversation ID"),
+    subject: Optional[str] = Form(None, description="Subject (e.g., Physics, Math)"),
+    topic: Optional[str] = Form(None, description="Topic (e.g., Newton's Laws, Calculus)")
+):
+    """
+    Generate a practice problem using web search and OpenAI.
+    Saves to conversation as a special message type.
+    """
+    try:
+        import asyncio
+        from langchain_community.tools.tavily_search import TavilySearchResults
+        from app.features.chat.utils.response import ResponseCreator
+        from datetime import datetime
+        from app.database.ai_tutor_collections import add_message_to_conversation
+        
+        logger.info(f"[PRACTICE PROBLEM] Starting for conversation {conversation_id}, Subject: {subject}, Topic: {topic}")
+        
+        if not subject and not topic:
+            raise HTTPException(status_code=400, detail="Either subject or topic must be provided")
+        
+        repo = AITutorRepository()
+        conversation = await repo.get_conversation_by_id(conversation_id)
+        
+        if not conversation:
+            raise HTTPException(status_code=404, detail="Conversation not found")
+        
+        search_query = f"{subject} {topic} practice problems examples".strip() if subject and topic else (topic or subject)
+        logger.info(f"[PRACTICE PROBLEM] Search query: {search_query}")
+        
+        # Perform web search
+        web_results = []
+        try:
+            TAVILY_API_KEY = "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"
+            tool = TavilySearchResults(tavily_api_key=TAVILY_API_KEY)
+            loop = asyncio.get_event_loop()
+            web_results = await loop.run_in_executor(None, tool.invoke, search_query)
+            
+            if web_results:
+                logger.info(f"[PRACTICE PROBLEM] ✅ Web search completed: {len(web_results)} results")
+            else:
+                logger.warning("[PRACTICE PROBLEM] ⚠️ No web search results found")
+        except Exception as e:
+            logger.error(f"[PRACTICE PROBLEM] ❌ Web search failed: {e}")
+            web_results = []
+        
+        # Generate practice problem
+        try:
+            web_context = ""
+            if web_results:
+                top_results = web_results[:3]
+                web_context = "\n\n".join([
+                    f"**{result.get('title', 'Source')}**:\n{result.get('content', '')}"
+                    for result in top_results
+                ])
+            
+            prompt = [
+                {
+                    "role": "system",
+                    "content": f"""You are an expert {subject or 'teacher'} creating practice problems for students.
+
+Your task is to create a well-structured practice problem that:
+- Is appropriate for the student's level
+- Tests understanding of key concepts
+- Includes clear instructions
+- Has a step-by-step solution
+- Uses real-world applications when possible
+
+Format your response with markdown:
+- Use headings for Problem Statement and Solution
+- Use code blocks for formulas and calculations
+- Use bullet points for steps
+- Make it engaging and educational"""
+                },
+                {
+                    "role": "user",
+                    "content": f"""Create a practice problem for:
+
+**Subject:** {subject or 'General'}
+**Topic:** {topic or 'General'}
+
+### Web Search Context (for accuracy):
+{web_context if web_context else "No additional web context available (using your knowledge)"}
+
+Provide a complete practice problem with:
+1. Problem Statement (clear and well-defined)
+2. Step-by-step Solution (detailed explanation)
+3. Key Takeaways (what the student should learn)
+
+Your Practice Problem:"""
+                }
+            ]
+            
+            logger.info("[PRACTICE PROBLEM] 🤖 Generating practice problem with OpenAI...")
+            problem = await ResponseCreator().gpt_response_without_stream(prompt)
+            
+            if not problem or not problem.strip():
+                raise Exception("Empty problem generated")
+            
+            logger.info(f"[PRACTICE PROBLEM] ✅ Problem generated: {len(problem)} characters")
+            
+            # Update conversation with practice_problem field (directly in database)
+            # NOTE: We do NOT add this as a chat message - it should only appear in the quick action modal
+            from app.database.ai_tutor_collections import update_conversation
+            update_fields = {
+                "practice_problem": {
+                    "subject": subject,
+                    "topic": topic,
+                    "problem": problem,
+                    "created_at": datetime.utcnow()
+                }
+            }
+            update_conversation(repo.db, conversation_id, update_fields)
+            
+            logger.info(f"[PRACTICE PROBLEM] ✅ Problem saved to conversation {conversation_id}")
+            
+            return {
+                "success": True,
+                "message": "Practice problem generated successfully",
+                "data": {
+                    "problem": problem,
+                    "subject": subject,
+                    "topic": topic,
+                    "conversation_id": conversation_id,
+                    "web_results_used": len(web_results) > 0
+                }
+            }
+            
+        except Exception as e:
+            logger.error(f"[PRACTICE PROBLEM] ❌ Error generating problem: {e}")
+            raise HTTPException(status_code=500, detail=f"Error generating practice problem: {str(e)}")
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"[PRACTICE PROBLEM] ❌ Error: {e}")
+        raise HTTPException(status_code=500, detail=f"Error generating practice problem: {str(e)}")
+
+
+@router.post("/study-guide")
+async def study_guide(
+    conversation_id: str = Form(..., description="Conversation ID"),
+    subject: Optional[str] = Form(None, description="Subject (e.g., Physics, Math)"),
+    topic: Optional[str] = Form(None, description="Topic (e.g., Newton's Laws, Calculus)")
+):
+    """
+    Generate a comprehensive study guide using web search and OpenAI.
+    Saves to conversation as a special message type.
+    """
+    try:
+        import asyncio
+        from langchain_community.tools.tavily_search import TavilySearchResults
+        from app.features.chat.utils.response import ResponseCreator
+        from datetime import datetime
+        from app.database.ai_tutor_collections import add_message_to_conversation
+        
+        logger.info(f"[STUDY GUIDE] Starting for conversation {conversation_id}, Subject: {subject}, Topic: {topic}")
+        
+        if not subject and not topic:
+            raise HTTPException(status_code=400, detail="Either subject or topic must be provided")
+        
+        repo = AITutorRepository()
+        conversation = await repo.get_conversation_by_id(conversation_id)
+        
+        if not conversation:
+            raise HTTPException(status_code=404, detail="Conversation not found")
+        
+        search_query = f"{subject} {topic} study guide summary".strip() if subject and topic else (topic or subject)
+        logger.info(f"[STUDY GUIDE] Search query: {search_query}")
+        
+        # Perform web search
+        web_results = []
+        try:
+            TAVILY_API_KEY = "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"
+            tool = TavilySearchResults(tavily_api_key=TAVILY_API_KEY)
+            loop = asyncio.get_event_loop()
+            web_results = await loop.run_in_executor(None, tool.invoke, search_query)
+            
+            if web_results:
+                logger.info(f"[STUDY GUIDE] ✅ Web search completed: {len(web_results)} results")
+            else:
+                logger.warning("[STUDY GUIDE] ⚠️ No web search results found")
+        except Exception as e:
+            logger.error(f"[STUDY GUIDE] ❌ Web search failed: {e}")
+            web_results = []
+        
+        # Generate study guide
+        try:
+            web_context = ""
+            if web_results:
+                top_results = web_results[:3]
+                web_context = "\n\n".join([
+                    f"**{result.get('title', 'Source')}**:\n{result.get('content', '')}"
+                    for result in top_results
+                ])
+            
+            prompt = [
+                {
+                    "role": "system",
+                    "content": f"""You are an expert {subject or 'teacher'} creating comprehensive study guides for students.
+
+Your task is to create a well-organized study guide that:
+- Covers all key concepts systematically
+- Includes definitions, formulas, and important facts
+- Has clear sections and subsections
+- Includes examples and applications
+- Provides learning tips and mnemonics
+- Is easy to review and memorize
+
+Format your response with markdown:
+- Use clear headings (##, ###) for sections
+- Use bullet points for lists
+- Use **bold** for important terms
+- Use code blocks for formulas
+- Make it comprehensive but organized"""
+                },
+                {
+                    "role": "user",
+                    "content": f"""Create a comprehensive study guide for:
+
+**Subject:** {subject or 'General'}
+**Topic:** {topic or 'General'}
+
+### Web Search Context (for accuracy):
+{web_context if web_context else "No additional web context available (using your knowledge)"}
+
+Provide a complete study guide with:
+1. Overview (what this topic covers)
+2. Key Concepts (definitions and explanations)
+3. Important Formulas/Equations (if applicable)
+4. Examples and Applications
+5. Study Tips and Mnemonics
+6. Summary (key takeaways)
+
+Your Study Guide:"""
+                }
+            ]
+            
+            logger.info("[STUDY GUIDE] 🤖 Generating study guide with OpenAI...")
+            guide = await ResponseCreator().gpt_response_without_stream(prompt)
+            
+            if not guide or not guide.strip():
+                raise Exception("Empty study guide generated")
+            
+            logger.info(f"[STUDY GUIDE] ✅ Study guide generated: {len(guide)} characters")
+            
+            # Update conversation with study_guide field (directly in database)
+            # NOTE: We do NOT add this as a chat message - it should only appear in the quick action modal
+            from app.database.ai_tutor_collections import update_conversation
+            update_fields = {
+                "study_guide": {
+                    "subject": subject,
+                    "topic": topic,
+                    "guide": guide,
+                    "created_at": datetime.utcnow()
+                }
+            }
+            update_conversation(repo.db, conversation_id, update_fields)
+            
+            logger.info(f"[STUDY GUIDE] ✅ Study guide saved to conversation {conversation_id}")
+            
+            return {
+                "success": True,
+                "message": "Study guide generated successfully",
+                "data": {
+                    "guide": guide,
+                    "subject": subject,
+                    "topic": topic,
+                    "conversation_id": conversation_id,
+                    "web_results_used": len(web_results) > 0
+                }
+            }
+            
+        except Exception as e:
+            logger.error(f"[STUDY GUIDE] ❌ Error generating study guide: {e}")
+            raise HTTPException(status_code=500, detail=f"Error generating study guide: {str(e)}")
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"[STUDY GUIDE] ❌ Error: {e}")
+        raise HTTPException(status_code=500, detail=f"Error generating study guide: {str(e)}")
+
+
+@router.post("/key-points")
+async def key_points(
+    conversation_id: str = Form(..., description="Conversation ID"),
+    subject: Optional[str] = Form(None, description="Subject (e.g., Physics, Math)"),
+    topic: Optional[str] = Form(None, description="Topic (e.g., Newton's Laws, Calculus)")
+):
+    """
+    Generate key points summary using web search and OpenAI.
+    Saves to conversation as a special message type.
+    """
+    try:
+        import asyncio
+        from langchain_community.tools.tavily_search import TavilySearchResults
+        from app.features.chat.utils.response import ResponseCreator
+        from datetime import datetime
+        from app.database.ai_tutor_collections import add_message_to_conversation
+        
+        logger.info(f"[KEY POINTS] Starting for conversation {conversation_id}, Subject: {subject}, Topic: {topic}")
+        
+        if not subject and not topic:
+            raise HTTPException(status_code=400, detail="Either subject or topic must be provided")
+        
+        repo = AITutorRepository()
+        conversation = await repo.get_conversation_by_id(conversation_id)
+        
+        if not conversation:
+            raise HTTPException(status_code=404, detail="Conversation not found")
+        
+        search_query = f"{subject} {topic} key points summary".strip() if subject and topic else (topic or subject)
+        logger.info(f"[KEY POINTS] Search query: {search_query}")
+        
+        # Perform web search
+        web_results = []
+        try:
+            TAVILY_API_KEY = "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"
+            tool = TavilySearchResults(tavily_api_key=TAVILY_API_KEY)
+            loop = asyncio.get_event_loop()
+            web_results = await loop.run_in_executor(None, tool.invoke, search_query)
+            
+            if web_results:
+                logger.info(f"[KEY POINTS] ✅ Web search completed: {len(web_results)} results")
+            else:
+                logger.warning("[KEY POINTS] ⚠️ No web search results found")
+        except Exception as e:
+            logger.error(f"[KEY POINTS] ❌ Web search failed: {e}")
+            web_results = []
+        
+        # Generate key points
+        try:
+            web_context = ""
+            if web_results:
+                top_results = web_results[:3]
+                web_context = "\n\n".join([
+                    f"**{result.get('title', 'Source')}**:\n{result.get('content', '')}"
+                    for result in top_results
+                ])
+            
+            prompt = [
+                {
+                    "role": "system",
+                    "content": f"""You are an expert {subject or 'teacher'} summarizing key points for students.
+
+Your task is to create a concise, memorable list of key points that:
+- Highlights the most important concepts
+- Is easy to remember and review
+- Uses clear, simple language
+- Covers essential facts, formulas, and principles
+- Is organized logically
+- Can be used for quick revision
+
+Format your response with markdown:
+- Use clear headings for organization
+- Use numbered or bulleted lists
+- Use **bold** for key terms
+- Use code blocks for formulas
+- Keep it concise but comprehensive"""
+                },
+                {
+                    "role": "user",
+                    "content": f"""Create key points summary for:
+
+**Subject:** {subject or 'General'}
+**Topic:** {topic or 'General'}
+
+### Web Search Context (for accuracy):
+{web_context if web_context else "No additional web context available (using your knowledge)"}
+
+Provide a well-organized list of key points that students should remember:
+1. Main Concepts (3-5 most important ideas)
+2. Key Definitions (essential terms)
+3. Important Formulas/Equations (if applicable)
+4. Practical Applications (real-world uses)
+5. Quick Tips (memory aids or shortcuts)
+
+Your Key Points:"""
+                }
+            ]
+            
+            logger.info("[KEY POINTS] 🤖 Generating key points with OpenAI...")
+            key_points_text = await ResponseCreator().gpt_response_without_stream(prompt)
+            
+            if not key_points_text or not key_points_text.strip():
+                raise Exception("Empty key points generated")
+            
+            logger.info(f"[KEY POINTS] ✅ Key points generated: {len(key_points_text)} characters")
+            
+            # Update conversation with key_points field (directly in database)
+            # NOTE: We do NOT add this as a chat message - it should only appear in the quick action modal
+            from app.database.ai_tutor_collections import update_conversation
+            update_fields = {
+                "key_points": {
+                    "subject": subject,
+                    "topic": topic,
+                    "key_points": key_points_text,
+                    "created_at": datetime.utcnow()
+                }
+            }
+            update_conversation(repo.db, conversation_id, update_fields)
+            
+            logger.info(f"[KEY POINTS] ✅ Key points saved to conversation {conversation_id}")
+            
+            return {
+                "success": True,
+                "message": "Key points generated successfully",
+                "data": {
+                    "key_points": key_points_text,
+                    "subject": subject,
+                    "topic": topic,
+                    "conversation_id": conversation_id,
+                    "web_results_used": len(web_results) > 0
+                }
+            }
+            
+        except Exception as e:
+            logger.error(f"[KEY POINTS] ❌ Error generating key points: {e}")
+            raise HTTPException(status_code=500, detail=f"Error generating key points: {str(e)}")
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"[KEY POINTS] ❌ Error: {e}")
+        raise HTTPException(status_code=500, detail=f"Error generating key points: {str(e)}")
+
+
+# ===== EXPLAIN CONCEPT ENDPOINT =====
+
+@router.post("/explain-concept")
+async def explain_concept(
+    conversation_id: str = Form(..., description="Conversation ID"),
+    subject: Optional[str] = Form(None, description="Subject (e.g., Physics, Math)"),
+    topic: Optional[str] = Form(None, description="Topic (e.g., Newton's Laws, Calculus)")
+):
+    """
+    Explain a concept using web search and OpenAI.
+    Saves explanation to conversation as a special message type.
+    """
+    try:
+        import asyncio
+        from langchain_community.tools.tavily_search import TavilySearchResults
+        from app.features.chat.utils.response import ResponseCreator
+        
+        logger.info(f"[EXPLAIN CONCEPT] Starting for conversation {conversation_id}, Subject: {subject}, Topic: {topic}")
+        
+        # Validate inputs
+        if not subject and not topic:
+            raise HTTPException(status_code=400, detail="Either subject or topic must be provided")
+        
+        # Get conversation
+        repo = AITutorRepository()
+        conversation = await repo.get_conversation_by_id(conversation_id)
+        
+        if not conversation:
+            raise HTTPException(status_code=404, detail="Conversation not found")
+        
+        user_id = conversation.get("user_id")
+        
+        # Construct search query
+        search_query = f"{subject} {topic}".strip() if subject and topic else (topic or subject)
+        logger.info(f"[EXPLAIN CONCEPT] Search query: {search_query}")
+        
+        # Perform web search
+        web_results = []
+        try:
+            TAVILY_API_KEY = "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"
+            tool = TavilySearchResults(tavily_api_key=TAVILY_API_KEY)
+            
+            loop = asyncio.get_event_loop()
+            web_results = await loop.run_in_executor(None, tool.invoke, search_query)
+            
+            if web_results:
+                logger.info(f"[EXPLAIN CONCEPT] ✅ Web search completed: {len(web_results)} results")
+                logger.info(f"[EXPLAIN CONCEPT] First result: {web_results[0].get('title', 'No title')}")
+            else:
+                logger.warning("[EXPLAIN CONCEPT] ⚠️ No web search results found")
+        except Exception as e:
+            logger.error(f"[EXPLAIN CONCEPT] ❌ Web search failed: {e}")
+            web_results = []
+        
+        # Generate explanation using OpenAI
+        try:
+            web_context = ""
+            if web_results:
+                # Combine top 3 results
+                top_results = web_results[:3]
+                web_context = "\n\n".join([
+                    f"**{result.get('title', 'Source')}**:\n{result.get('content', '')}"
+                    for result in top_results
+                ])
+            
+            # Create comprehensive prompt for explanation (as messages array format)
+            explanation_prompt = [
+                {
+                    "role": "system",
+                    "content": f"""You are an expert {subject or 'teacher'} explaining concepts to students in a clear, engaging, and comprehensive way.
+
+Your task is to provide a well-structured explanation that covers:
+- **Introduction**: What is this concept?
+- **Key Points**: Main ideas and principles
+- **Examples**: Real-world examples or analogies
+- **Why it matters**: Practical applications or importance
+- **Summary**: Key takeaways
+
+Use simple language that students can understand, break down complex ideas into digestible parts, and make it engaging and educational.
+Keep it comprehensive but not overwhelming (aim for 300-500 words).
+Use markdown formatting for better readability."""
+                },
+                {
+                    "role": "user",
+                    "content": f"""Please explain the following concept:
+
+{'**Subject:** ' + subject if subject else ''}
+{'**Topic:** ' + topic if topic else ''}
+
+### Web Search Context (for accuracy):
+{web_context if web_context else "No additional web context available (using your knowledge)"}
+
+Provide a clear, well-structured explanation with markdown formatting:
+- Use headings (##, ###) for sections
+- Use bullet points for lists
+- Use **bold** for important terms
+- Use code blocks for formulas or technical terms
+
+Your Explanation:"""
+                }
+            ]
+            
+            logger.info("[EXPLAIN CONCEPT] 🤖 Generating explanation with OpenAI...")
+            explanation = await ResponseCreator().gpt_response_without_stream(explanation_prompt)
+            
+            if not explanation or not explanation.strip():
+                raise Exception("Empty explanation generated")
+            
+            logger.info(f"[EXPLAIN CONCEPT] ✅ Explanation generated: {len(explanation)} characters")
+            
+            # Update conversation with explain_concept field (directly in database)
+            # NOTE: We do NOT add this as a chat message - it should only appear in the quick action modal
+            from app.database.ai_tutor_collections import update_conversation
+            update_fields = {
+                "explain_concept": {
+                    "subject": subject,
+                    "topic": topic,
+                    "explanation": explanation,
+                    "created_at": datetime.utcnow()
+                }
+            }
+            update_conversation(repo.db, conversation_id, update_fields)
+            
+            logger.info(f"[EXPLAIN CONCEPT] ✅ Explanation saved to conversation {conversation_id}")
+            
+            return {
+                "success": True,
+                "message": "Concept explained successfully",
+                "data": {
+                    "explanation": explanation,
+                    "subject": subject,
+                    "topic": topic,
+                    "conversation_id": conversation_id,
+                    "web_results_used": len(web_results) > 0
+                }
+            }
+            
+        except Exception as e:
+            logger.error(f"[EXPLAIN CONCEPT] ❌ Error generating explanation: {e}")
+            raise HTTPException(status_code=500, detail=f"Error generating explanation: {str(e)}")
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"[EXPLAIN CONCEPT] ❌ Error: {e}")
+        raise HTTPException(status_code=500, detail=f"Error explaining concept: {str(e)}")
 
 
 # ===== END CONVERSATION ENDPOINT =====
@@ -512,9 +1116,11 @@ async def handle_user_message(message_data: dict, conversation_id: str, websocke
         repo = AITutorRepository()
         conversation = await repo.get_conversation_by_id(conversation_id)
         selected_subject = conversation.get("subject", "") if conversation else ""
-        selected_topic = conversation.get("topic", "") if conversation else ""  # ✅ Get topic
+        selected_topic = conversation.get("topic", "") if conversation else ""
+        exam_type = conversation.get("exam_type", "") if conversation else ""
         print(f"[AI_TUTOR] 📚 Selected Subject: {selected_subject if selected_subject else 'Not specified'}")
         print(f"[AI_TUTOR] 🎯 Selected Topic: {selected_topic if selected_topic else 'Not specified'}")
+        print(f"[AI_TUTOR] 🎓 Exam Type: {exam_type if exam_type else 'Not specified'}")
         
         # Create WebSocket response handler
         websocket_response = AITutorWebSocketResponse(
@@ -538,8 +1144,9 @@ async def handle_user_message(message_data: dict, conversation_id: str, websocke
                 websocket_response=websocket_response,
                 timezone=message_data.get("timezone", "UTC"),
                 language_code=message_data.get("languageCode", "en"),
-                selected_subject=selected_subject,  # ✅ Pass subject context
-                selected_topic=selected_topic  # ✅ Pass topic context
+                selected_subject=selected_subject,
+                selected_topic=selected_topic,
+                exam_type=exam_type
             )
         
         bot_message = bot_message_handlers[conversation_id]

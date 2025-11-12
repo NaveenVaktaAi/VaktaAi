@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import re
+import hashlib
 from datetime import datetime
 from typing import Optional, Dict, Any, List
 from fastapi import WebSocket
@@ -28,8 +29,9 @@ class AITutorBotHandler:
         user_id: str,
         time_zone: str = "UTC",
         language_code: str = "en",
-        selected_subject: str = "",  # ✅ Subject parameter
-        selected_topic: str = ""  # ✅ Topic parameter
+        selected_subject: str = "",
+        selected_topic: str = "",
+        exam_type: str = ""
     ):
         self.ai_tutor_repository = ai_tutor_repository
         self.websocket_response = websocket_response
@@ -37,11 +39,66 @@ class AITutorBotHandler:
         self.user_id = user_id
         self.time_zone = time_zone
         self.language_code = language_code
-        self.selected_subject = selected_subject  # ✅ Store subject
-        self.selected_topic = selected_topic  # ✅ Store topic
+        self.selected_subject = selected_subject
+        self.selected_topic = selected_topic
+        self.exam_type = exam_type
         
         # In-memory messages list for this conversation session
         self.messages: List[Dict[str, Any]] = []
+        
+        # Track which messages existed in DB at the start (to avoid duplicates)
+        self._existing_message_ids: set = set()
+        
+        # Will be loaded asynchronously when needed
+        self._messages_loaded = False
+
+    async def _ensure_messages_loaded(self):
+        """Ensure existing messages are loaded from database"""
+        if not self._messages_loaded:
+            try:
+                existing_messages = await self.ai_tutor_repository.get_conversation_messages(self.conversation_id)
+                
+                # Filter out quick action messages
+                quick_action_types = ['explain_concept', 'practice_problem', 'study_guide', 'key_points']
+                existing_messages = [
+                    msg for msg in existing_messages 
+                    if not (msg.get('type') and msg.get('type') in quick_action_types)
+                ]
+                
+                if existing_messages:
+                    self.messages = existing_messages
+                    # Create unique IDs for existing messages based on content + timestamp + role
+                    # This helps detect duplicates even when tokens are None
+                    for msg in existing_messages:
+                        msg_id = self._get_message_id(msg)
+                        self._existing_message_ids.add(msg_id)
+                    print(f"[AI_TUTOR] ✅ Loaded {len(existing_messages)} existing messages into memory for conversation {self.conversation_id}")
+                else:
+                    print(f"[AI_TUTOR] No existing messages found for conversation {self.conversation_id}")
+                
+                self._messages_loaded = True
+            except Exception as e:
+                print(f"[AI_TUTOR] Error loading existing messages: {e}")
+                self._messages_loaded = True  # Mark as loaded to avoid retrying
+    
+    def _get_message_id(self, msg: Dict[str, Any]) -> str:
+        """Create a unique ID for a message based on content, timestamp, and role"""
+        # Use content + created_ts + is_bot to create unique ID
+        content = msg.get('message', '')
+        created_ts = msg.get('created_ts')
+        is_bot = msg.get('is_bot', False)
+        
+        # Convert datetime to string if needed
+        if isinstance(created_ts, datetime):
+            ts_str = created_ts.isoformat()
+        elif created_ts:
+            ts_str = str(created_ts)
+        else:
+            ts_str = ''
+        
+        # Create hash-like ID
+        msg_str = f"{content[:100]}_{ts_str}_{is_bot}"
+        return hashlib.md5(msg_str.encode()).hexdigest()
 
     async def handle_user_message(self, user_message: str, isAudio: bool = True, images: Optional[List[str]] = None, pdfs: Optional[List[str]] = None) -> bool:
         """
@@ -57,6 +114,8 @@ class AITutorBotHandler:
             pdfs: Optional list of PDF URLs for document analysis
         """
         try:
+            # Ensure existing messages are loaded before processing new message
+            await self._ensure_messages_loaded()
             print(f"[AI_TUTOR] Processing user message: '{user_message}' for conversation: {self.conversation_id}")
             if images:
                 print(f"[AI_TUTOR] 🖼️ Images received: {len(images)} image(s)")
@@ -323,23 +382,26 @@ class AITutorBotHandler:
                 "translated_input": ""
             })
 
-        # Build STRONG subject + topic context for personalized greetings - AI is ALWAYS the teacher
+        # Build STRONG subject + topic + exam context for personalized greetings - AI is ALWAYS the teacher
         subject_greeting_context = ""
         if self.selected_subject:
             topic_part = f" on {self.selected_topic}" if self.selected_topic else ""
-            example_greeting = f"Hello! I'm your {self.selected_subject} teacher{topic_part}. I have complete knowledge of {self.selected_subject}{f' and expertise in {self.selected_topic}' if self.selected_topic else ''}. How can I help you{' with {}'.format(self.selected_topic) if self.selected_topic else ' today'}?"
+            exam_context = f" preparing for {self.exam_type}" if self.exam_type else ""
+            example_greeting = f"Hello! I'm your {self.selected_subject} teacher{topic_part}{exam_context}. I have complete knowledge of {self.selected_subject}{f' and expertise in {self.selected_topic}' if self.selected_topic else ''}. How can I help you{' with {}'.format(self.selected_topic) if self.selected_topic else ' today'}?"
             
             subject_greeting_context = f"""
 🎓 YOUR ROLE AS TEACHER:
-**YOU ARE THE TEACHER OF {self.selected_subject.upper()}{f' WITH EXPERTISE IN {self.selected_topic.upper()}' if self.selected_topic else ''}.**
+**YOU ARE THE TEACHER OF {self.selected_subject.upper()}{f' WITH EXPERTISE IN {self.selected_topic.upper()}' if self.selected_topic else ''}{f' FOR {self.exam_type.upper()} PREPARATION' if self.exam_type else ''}.**
 - You have COMPLETE knowledge of {self.selected_subject}{f' and specialized expertise in {self.selected_topic}' if self.selected_topic else ''}.
+{f'- CRITICAL: The student is preparing for {self.exam_type}. Tailor your teaching style, difficulty level, and explanations to match {self.exam_type} exam standards and requirements.' if self.exam_type else ''}
 - REMEMBER: You are ALWAYS acting as the {self.selected_subject} teacher in every conversation.
 
-📚 SUBJECT CONTEXT: The student has selected **{self.selected_subject}**{f' with focus on **{self.selected_topic}**' if self.selected_topic else ''}.
+📚 SUBJECT CONTEXT: The student has selected **{self.selected_subject}**{f' with focus on **{self.selected_topic}**' if self.selected_topic else ''}{f' for **{self.exam_type}** preparation' if self.exam_type else ''}.
 
 **GREETING RULE**: When user says greetings (hello, hi, namaste, etc.) or casual conversation:
-- ALWAYS introduce yourself as their {self.selected_subject} teacher{topic_part}
+- ALWAYS introduce yourself as their {self.selected_subject} teacher{topic_part}{exam_context}
 - Emphasize that you have complete knowledge of {self.selected_subject}{f' and expertise in {self.selected_topic}' if self.selected_topic else ''}
+{f'- Mention that you understand {self.exam_type} exam requirements and can help them prepare effectively.' if self.exam_type else ''}
 - Example: "{example_greeting}"
 - Keep it warm, encouraging, and specific to their learning focus
 - Respond in the user's detected language
@@ -506,7 +568,7 @@ CHAT_HISTORY_LAST_TWO: {chat_history_text}
                 # Send generating indicator with audio
                 await self.websocket_response.send_thinking_indicator(
                     message="Now, let me prepare a detailed explanation for you...",  # Audio
-                    display_message="✨ Generating detailed response and audio...",    # UI text
+                    display_message="✨ detailed response",    # UI text
                     status="generating",
                     language_code=language_code,
                     enable_audio=True  # ✅ Audio mode - speak the status
@@ -710,25 +772,27 @@ CHAT_HISTORY_LAST_TWO: {chat_history_text}
                     pdf_context += f"\n--- Document {idx + 1} ---\n{pdf_text}\n"
                 pdf_context += "\nUse the above document content to answer the user's question accurately."
             
-            # Build STRONG subject + topic context - AI is ALWAYS the teacher of selected subject
+            # Build STRONG subject + topic + exam context - AI is ALWAYS the teacher of selected subject
             subject_context = ""
             teacher_role = ""
             if self.selected_subject:
                 topic_part = f", specifically on **{self.selected_topic}**" if self.selected_topic else ""
+                exam_context = f" for **{self.exam_type}** preparation" if self.exam_type else ""
                 subject_context = f"""
 ### 🎓 YOUR ROLE AS TEACHER:
-**YOU ARE THE TEACHER OF {self.selected_subject.upper()}{topic_part.upper().replace('**', '') if self.selected_topic else ''}.**
+**YOU ARE THE TEACHER OF {self.selected_subject.upper()}{topic_part.upper().replace('**', '') if self.selected_topic else ''}{f' FOR {self.exam_type.upper()} PREPARATION' if self.exam_type else ''}.**
 - You have deep expertise and knowledge in **{self.selected_subject}**.
 {f'- You have specialized knowledge in **{self.selected_topic}** and are an expert in this topic.' if self.selected_topic else ''}
+{f'- CRITICAL: The student is preparing for {self.exam_type}. Tailor your teaching style, difficulty level, explanations, and examples to match {self.exam_type} exam standards, syllabus, and question patterns.' if self.exam_type else ''}
 - REMEMBER: Every conversation you have, you are acting as this {self.selected_subject} teacher.
 - You have COMPLETE knowledge of {self.selected_subject}{f' and especially {self.selected_topic}' if self.selected_topic else ''}.
-- Approach EVERY question from your perspective as the {self.selected_subject} teacher.
+- Approach EVERY question from your perspective as the {self.selected_subject} teacher{f' preparing students for {self.exam_type}' if self.exam_type else ''}.
 - Your identity and expertise as a {self.selected_subject} teacher should be reflected in your responses.
-{f'- When explaining {self.selected_topic}, draw from your deep understanding as a {self.selected_topic} expert.' if self.selected_topic else ''}
+{f'- When explaining {self.selected_topic}, draw from your deep understanding as a {self.selected_topic} expert and align with {self.exam_type} requirements.' if self.selected_topic and self.exam_type else f'- When explaining {self.selected_topic}, draw from your deep understanding as a {self.selected_topic} expert.' if self.selected_topic else ''}
 
-### 📚 Selected Subject{f' - {self.selected_topic}' if self.selected_topic else ''}:
-The student has chosen to study **{self.selected_subject}**{f' with focus on **{self.selected_topic}**' if self.selected_topic else ''} in this session.
-You are their dedicated {self.selected_subject} teacher{f' with expertise in {self.selected_topic}' if self.selected_topic else ''}.
+### 📚 Selected Subject{f' - {self.selected_topic}' if self.selected_topic else ''}{f' ({self.exam_type})' if self.exam_type else ''}:
+The student has chosen to study **{self.selected_subject}**{f' with focus on **{self.selected_topic}**' if self.selected_topic else ''}{f' for **{self.exam_type}** preparation' if self.exam_type else ''} in this session.
+You are their dedicated {self.selected_subject} teacher{f' with expertise in {self.selected_topic}' if self.selected_topic else ''}{f' helping them prepare for {self.exam_type}' if self.exam_type else ''}.
 """
             
             # Construct the prompt for AI tutoring with STRONG subject awareness
@@ -747,14 +811,15 @@ You are their dedicated {self.selected_subject} teacher{f' with expertise in {se
 
 ### Instructions:
 - Respond in the user's language: {detected_language}.
-- Act as a patient, knowledgeable {f'{self.selected_subject} teacher' if self.selected_subject else 'tutor'} who explains concepts clearly.
-{f'- Always remember: You are the {self.selected_subject} teacher. You have complete knowledge of {self.selected_subject}{f" and {self.selected_topic}" if self.selected_topic else ""}.' if self.selected_subject else ''}
+- Act as a patient, knowledgeable {f'{self.selected_subject} teacher' if self.selected_subject else 'tutor'} who explains concepts clearly{f' aligned with {self.exam_type} standards' if self.exam_type else ''}.
+{f'- Always remember: You are the {self.selected_subject} teacher{f' preparing students for {self.exam_type}' if self.exam_type else ''}. You have complete knowledge of {self.selected_subject}{f" and {self.selected_topic}" if self.selected_topic else ""}.' if self.selected_subject else ''}
 - If web search results or PDF documents are available, use them for accurate context.
 - Break down complex topics into simple, understandable parts.
-- Use examples and analogies when helpful.
+{f'- Use examples and problem patterns typical of {self.exam_type} when relevant.' if self.exam_type else '- Use examples and analogies when helpful.'}
 - Encourage learning by asking follow-up questions when appropriate.
 - If you don't know something, be honest and guide the student to learn more.
 - Keep your response educational, accurate, and engaging.
+{f'- When explaining concepts, relate them to {self.exam_type} exam format and difficulty level when relevant.' if self.exam_type else ''}
 
 ### 🎯 Subject Focus Strategy:
 {f'''- CRITICAL: You are the teacher of **{self.selected_subject}**{f' with expertise in **{self.selected_topic}**' if self.selected_topic else ''}.
@@ -771,7 +836,10 @@ You are their dedicated {self.selected_subject} teacher{f' with expertise in {se
             # Create proper message format for OpenAI API with STRONG system message
             system_message_content = f"You are a helpful {f'{self.selected_subject} teacher' if self.selected_subject else 'AI tutor'} that teaches students with patience and clarity. You adapt to the student's level and explain concepts in an engaging way."
             if self.selected_subject:
-                system_message_content += f" IMPORTANT: You are the teacher of {self.selected_subject}{f' with expertise in {self.selected_topic}' if self.selected_topic else ''}. You have complete knowledge of this subject and should always approach questions from this perspective."
+                exam_info = f" preparing for {self.exam_type}" if self.exam_type else ""
+                system_message_content += f" IMPORTANT: You are the teacher of {self.selected_subject}{f' with expertise in {self.selected_topic}' if self.selected_topic else ''}{exam_info}. You have complete knowledge of this subject and should always approach questions from this perspective."
+                if self.exam_type:
+                    system_message_content += f" Tailor your teaching to match {self.exam_type} exam standards and requirements."
             
             messages = [
                 {
@@ -1039,11 +1107,43 @@ Respond in the same language as the full response."""
         """Save all in-memory messages to database (call this when conversation ends)"""
         try:
             if self.messages:
-                await self.ai_tutor_repository.save_messages_to_conversation(
-                    self.conversation_id, 
-                    self.messages
-                )
-                print(f"💾 Saved {len(self.messages)} messages to conversation {self.conversation_id}")
+                # Get existing messages from database to ensure we have latest state
+                existing_messages = await self.ai_tutor_repository.get_conversation_messages(self.conversation_id)
+                
+                # Filter out quick action messages (they shouldn't be in chat)
+                quick_action_types = ['explain_concept', 'practice_problem', 'study_guide', 'key_points']
+                existing_messages = [
+                    msg for msg in existing_messages 
+                    if not (msg.get('type') and msg.get('type') in quick_action_types)
+                ]
+                
+                # Create a set of existing message IDs for duplicate detection
+                existing_message_ids = {self._get_message_id(msg) for msg in existing_messages}
+                
+                # Filter new messages - only include ones NOT already in DB
+                new_messages_to_add = []
+                for msg in self.messages:
+                    msg_id = self._get_message_id(msg)
+                    # Only add if message is not in existing messages AND not already tracked
+                    if msg_id not in existing_message_ids and msg_id not in self._existing_message_ids:
+                        new_messages_to_add.append(msg)
+                        # Track this message so we don't add it again
+                        self._existing_message_ids.add(msg_id)
+                
+                if new_messages_to_add:
+                    # Combine existing and new messages
+                    all_messages = existing_messages + new_messages_to_add
+                    
+                    # Sort by created_ts to maintain chronological order
+                    all_messages.sort(key=lambda x: x.get('created_ts') if isinstance(x.get('created_ts'), datetime) else datetime.utcnow())
+                    
+                    await self.ai_tutor_repository.save_messages_to_conversation(
+                        self.conversation_id, 
+                        all_messages
+                    )
+                    print(f"💾 Saved {len(existing_messages)} existing + {len(new_messages_to_add)} new = {len(all_messages)} total messages to conversation {self.conversation_id}")
+                else:
+                    print(f"💾 No new messages to save (all {len(self.messages)} messages already exist in DB)")
         except Exception as e:
             logger.error(f"Error saving messages to DB: {e}")
             print(f"Error saving messages to DB: {e}")
@@ -1062,21 +1162,23 @@ class AITutorBotMessage:
         websocket_response: AITutorWebSocketResponse = None,
         timezone: str = "UTC",
         language_code: str = "en",
-        selected_subject: str = "",  # ✅ Subject parameter
-        selected_topic: str = ""  # ✅ Topic parameter
+        selected_subject: str = "",
+        selected_topic: str = "",
+        exam_type: str = ""
     ):
         self.conversation_id = conversation_id
         self.user_id = user_id
         self.websocket_response = websocket_response
         self.timezone = timezone
         self.language_code = language_code
-        self.selected_subject = selected_subject  # ✅ Store subject
-        self.selected_topic = selected_topic  # ✅ Store topic
+        self.selected_subject = selected_subject
+        self.selected_topic = selected_topic
+        self.exam_type = exam_type
         
         # Initialize AI tutor repository
         self.ai_tutor_repository = AITutorRepository()
         
-        # Initialize AI tutor bot handler with subject + topic context
+        # Initialize AI tutor bot handler with subject + topic + exam context
         self.bot_handler = AITutorBotHandler(
             self.ai_tutor_repository,
             self.websocket_response,
@@ -1084,8 +1186,9 @@ class AITutorBotMessage:
             self.user_id,
             self.timezone,
             self.language_code,
-            selected_subject,  # ✅ Pass subject to handler
-            selected_topic  # ✅ Pass topic to handler
+            selected_subject,
+            selected_topic,
+            exam_type
         )
 
     async def send_bot_message(self, user_message: str, isAudio: bool = True, images: Optional[List[str]] = None, pdfs: Optional[List[str]] = None) -> bool:

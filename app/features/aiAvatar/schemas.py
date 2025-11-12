@@ -21,6 +21,8 @@ class ConversationCreate(BaseModel):
     user_id: int = Field(..., description="ID of the user creating the conversation")
     title: str = Field(default="", description="Title of the conversation")
     status: str = Field(default="active", description="Status of the conversation (active/archived)")
+    exam_type: Optional[str] = Field(None, description="Type of exam (IIT JEE, NEET, General Conversation)")
+    exam_name: Optional[str] = Field(None, description="Name of the exam (same as exam_type for compatibility)")
     subject: Optional[str] = Field(None, description="Subject of conversation (e.g., Physics, Math)")
     topic: Optional[str] = Field(None, description="Specific topic within subject (e.g., Newton's Laws, Calculus)")
     tags: Optional[List[str]] = Field(None, description="Tags for categorization")
@@ -31,6 +33,8 @@ class ConversationUpdate(BaseModel):
     """Schema for updating a conversation"""
     title: Optional[str] = Field(None, description="Title of the conversation")
     status: Optional[str] = Field(None, description="Status of the conversation (active/archived)")
+    exam_type: Optional[str] = Field(None, description="Type of exam (IIT JEE, NEET, General Conversation)")
+    exam_name: Optional[str] = Field(None, description="Name of the exam (same as exam_type for compatibility)")
     subject: Optional[str] = Field(None, description="Subject of conversation")
     topic: Optional[str] = Field(None, description="Specific topic within subject")
     tags: Optional[List[str]] = Field(None, description="Tags for categorization")
@@ -43,10 +47,16 @@ class ConversationResponse(BaseModel):
     user_id: int
     title: str
     status: str
+    exam_type: Optional[str] = None
+    exam_name: Optional[str] = None
     subject: Optional[str] = None
     topic: Optional[str] = None
     tags: Optional[List[str]] = None
     messages: Optional[List[Dict[str, Any]]] = Field(default=[], description="List of messages in the conversation")
+    explain_concept: Optional[Dict[str, Any]] = Field(None, description="Explain concept data (subject, topic, explanation)")
+    practice_problem: Optional[Dict[str, Any]] = Field(None, description="Practice problem data (subject, topic, problem)")
+    study_guide: Optional[Dict[str, Any]] = Field(None, description="Study guide data (subject, topic, guide)")
+    key_points: Optional[Dict[str, Any]] = Field(None, description="Key points data (subject, topic, key_points)")
     created_at: datetime
     updated_at: datetime
     

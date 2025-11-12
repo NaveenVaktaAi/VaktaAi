@@ -99,10 +99,23 @@ def get_chat(db: Database, chat_id: str) -> Dict[str, Any]:
     return chats.find_one({"_id": ObjectId(chat_id)})
 
 
-def get_user_chats(db: Database, user_id: int) -> list:
+def get_user_chats(db: Database, user_id: str) -> list:
     """Get all chats for a user"""
     _, _, chats, _, _, _, _, _ = get_collections(db)
-    return list(chats.find({"user_id": user_id}).sort("created_at", -1))
+    # Handle both string (ObjectId) and integer user_id for backward compatibility
+    try:
+        # Try as string first (for ObjectId strings)
+        if isinstance(user_id, str) and len(user_id) == 24 and all(c in '0123456789abcdefABCDEF' for c in user_id):
+            # It's an ObjectId string, use as string
+            query = {"user_id": user_id}
+        else:
+            # Try to convert to integer (for backward compatibility)
+            query = {"user_id": int(user_id)}
+    except (ValueError, TypeError):
+        # If conversion fails, use as string
+        query = {"user_id": user_id}
+    
+    return list(chats.find(query).sort("created_at", -1))
 
 
 def update_chat(db: Database, chat_id: str, fields: Dict[str, Any]) -> None:

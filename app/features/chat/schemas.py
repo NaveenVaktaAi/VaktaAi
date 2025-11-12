@@ -6,7 +6,7 @@ from bson import ObjectId
 
 class ChatCreate(BaseModel):
     """Schema for creating a new chat"""
-    user_id: int = Field(..., description="ID of the user creating the chat")
+    user_id: Optional[str] = Field(None, description="ID of the user creating the chat (will be set from auth middleware)")  # Optional - extracted from auth token
     document_id: Optional[str] = Field(None, description="ID of the document this chat is related to")
     training_doc_id: Optional[str] = Field(None, description="ID of the training document this chat is related to")
     title: str = Field(..., description="Title of the chat")
@@ -23,7 +23,7 @@ class ChatUpdate(BaseModel):
 class ChatResponse(BaseModel):
     """Schema for chat response"""
     id: str = Field(..., alias="_id")
-    user_id: int
+    user_id: str  # Changed to str to support ObjectId strings
     document_id: Optional[str]
     title: str
     status: str
@@ -48,6 +48,7 @@ class ChatMessageCreate(BaseModel):
     type: Optional[str] = Field(default="text", description="Type of message (text, image, etc.)")
     is_edited: bool = Field(default=False, description="Whether the message has been edited")
     training_doc_id: Optional[str] = Field(None, description="ID of the training document this message is related to")
+    citation: Optional[str] = Field(None, description="Citation source: 'document', 'web_search', 'ai', or 'document + ai'")
 
 
 class ChatMessageUpdate(BaseModel):
@@ -68,6 +69,7 @@ class ChatMessageResponse(BaseModel):
     token: Optional[str]
     type: Optional[str]
     is_edited: Optional[bool] = False
+    citation: Optional[str] = Field(None, description="Citation source: 'document', 'web_search', 'ai', or 'document + ai'")
     created_ts: Optional[datetime]
     updated_ts: Optional[datetime]
 
